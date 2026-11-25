@@ -1,0 +1,8 @@
+node_modules/
+auth_session/
+*.mp4
+*.webp
+*.m4a
+*.ogg
+*.jpg
+.env
