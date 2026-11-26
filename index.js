@@ -116,7 +116,7 @@ function normalizePhoneNumber(rawInput) {
 
 // === PARSER CERDAS .JADWAL (MENDUKUNG FORMULIR KE BAWAH & SEBARIS KOMA/GARIS) ===
 function parseJadwalInput(rawText) {
-    const hasFormLabels = /(nomor|waktu|tanggal|waktu\/tanggal|jam|pesan)\s*:/i.test(rawText);
+    const hasFormLabels = /(nomor|nama|waktu|tanggal|waktu\/tanggal|jam|pesan)\s*:/i.test(rawText);
 
     // Mode A: Format Formulir Baris per Baris
     if (hasFormLabels) {
@@ -127,9 +127,15 @@ function parseJadwalInput(rawText) {
 
         for (const line of lines) {
             const trimmed = line.trim();
-            if (/^nomor\s*:/i.test(trimmed)) {
+            // Abaikan baris keterangan jika pengguna ikut menyalin seluruh pesan templat
+            if (/^_?keterangan\s*:/i.test(trimmed) || /^•/.test(trimmed)) {
+                currentField = null;
+                continue;
+            }
+
+            if (/^(nomor|nama)\s*:/i.test(trimmed)) {
                 currentField = 'nomor';
-                data.nomor = trimmed.replace(/^nomor\s*:/i, '').trim();
+                data.nomor = trimmed.replace(/^(nomor|nama)\s*:/i, '').trim();
             } else if (/^(waktu|tanggal|waktu\/tanggal|jam)\s*:/i.test(trimmed)) {
                 currentField = 'waktu';
                 data.waktu = trimmed.replace(/^(waktu|tanggal|waktu\/tanggal|jam)\s*:/i, '').trim();
@@ -162,7 +168,6 @@ function parseJadwalInput(rawText) {
         };
     }
 
-    // Jika hanya 3 bagian (.jadwal 081234..., 12:30, pesan) otomatis jumlah = 1
     if (segs.length === 3) {
         return {
             nomor: segs[0] || '',
@@ -691,25 +696,29 @@ async function startBot() {
             if (!isOwner) return;
             const rawBody = caption.slice(parts[0].length).trim();
 
-            // Jika diketik ".jadwal" saja tanpa isi, kirim templat formulir siap edit/copy
+            // Jika diketik ".jadwal" saja tanpa isi, kirim templat formulir kosong + keterangan
             if (!rawBody) {
                 await sock.sendMessage(
                     remoteJid,
                     {
                         text:
                             `.jadwal\n` +
-                            `Nomor: +62 812-3456-7890\n` +
-                            `Waktu: 12:30\n` +
-                            `Jumlah: 1\n` +
-                            `Pesan: Halo, ini pesan terjadwal!\n\n` +
-                            `_Tips: Salin templat di atas lalu Edit pesan ".jadwal"-mu atau langsung kirim dengan format sebaris: .jadwal 081234..., 12:30, 1, Pesan_`
+                            `Nomor: \n` +
+                            `Waktu: \n` +
+                            `Jumlah: \n` +
+                            `Pesan: \n\n` +
+                            `_Keterangan:_\n` +
+                            `• _Nomor: +62 812-xxx / 0812xxx / sini_\n` +
+                            `• _Waktu: 12:30 / 27-11-2026 07:00 / +15m_\n` +
+                            `• _Jumlah: 1 (default) atau 3:10 (3 pesan, jeda 10d)_\n` +
+                            `• _Cara pakai: Salin templat di atas lalu Edit pesan ".jadwal"-mu, atau ketik sebaris: .jadwal 0812xxx, 12:30, 1, Pesan_`
                     },
                     { quoted: msg }
                 );
                 return;
             }
 
-            // Reaksi tunggu ⏳ seperti di .sa
+            // Reaksi tunggu ⏳
             await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
 
             const form = parseJadwalInput(rawBody);
@@ -720,16 +729,9 @@ async function startBot() {
                     remoteJid,
                     {
                         text:
-                            `⚠️ *Format belum lengkap!*\n` +
-                            `Gunakan salah satu cara berikut:\n\n` +
-                            `*1. Sebaris Cepat:*\n` +
-                            `.jadwal 081234567890, 12:30, 1, Isi pesan\n\n` +
-                            `*2. Formulir (atau Edit pesanmu):*\n` +
-                            `.jadwal\n` +
-                            `Nomor: +62 812-3456-7890\n` +
-                            `Waktu: 12:30\n` +
-                            `Jumlah: 1\n` +
-                            `Pesan: Isi pesan`
+                            `⚠️ *Formulir belum lengkap!*\n` +
+                            `Pastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\n\n` +
+                            `Ketik *.jadwal* tanpa teks untuk menyalin templat kosong.`
                     },
                     { quoted: msg }
                 );
@@ -790,7 +792,7 @@ async function startBot() {
                 return;
             }
 
-            // Validasi & Normalisasi Nomor Tujuan (+62 123-456-789, 0123456789, 62123456789)
+            // Validasi & Normalisasi Nomor Tujuan
             let targetJid = '';
             let targetLabel = '';
 
