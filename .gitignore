@@ -6,3 +6,4 @@ auth_session/
 *.ogg
 *.jpg
 .env
+config.json

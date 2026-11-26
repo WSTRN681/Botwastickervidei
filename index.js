@@ -15,6 +15,11 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { execFile } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+const SESSION_PATH = path.join(__dirname, 'auth_session');
 
 // === PATCH PROTOBUF STATIC ENCODER: Suntikkan Field 26 (audioMessage) ke StickerMessage ===
 try {
@@ -48,6 +53,33 @@ try {
 } catch (e) {
     console.log('[WARN] Gagal patch Protobuf:', e.message);
 }
+
+// === MANAJEMEN CONFIG.JSON (ADMIN ONLY & OWNER) ===
+function loadConfig() {
+    const defaultConfig = {
+        adminOnly: true,
+        owners: [] // Masukkan nomor WA tambahan jika memakai 2 nomor, contoh: ["6281234567890"]
+    };
+    try {
+        if (!fs.existsSync(CONFIG_PATH)) {
+            fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
+            return defaultConfig;
+        }
+        const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        return {
+            adminOnly: typeof parsed.adminOnly === 'boolean' ? parsed.adminOnly : true,
+            owners: Array.isArray(parsed.owners) ? parsed.owners : []
+        };
+    } catch (err) {
+        return defaultConfig;
+    }
+}
+
+function saveConfig(cfg) {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+let botConfig = loadConfig();
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
@@ -124,12 +156,10 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
 function buildScaleFilter(size, cropMode, autoCrop) {
     let filterChain = [];
 
-    // 1. Jika mode auto & ada bingkai hitam bawaan, pangkas bingkai hitamnya dulu
     if (cropMode === 'auto' && autoCrop) {
         filterChain.push(autoCrop);
     }
 
-    // 2. Terapkan pemotongan 1:1 sesuai perintah atau skala proporsional transparan
     switch (cropMode) {
         case 'tengah':
         case 'center':
@@ -158,7 +188,6 @@ function buildScaleFilter(size, cropMode, autoCrop) {
             filterChain.push(`format=yuva420p,scale=${size}:${size}:flags=lanczos`);
             break;
         default:
-            // Mode auto: pertahankan rasio asli secara utuh dengan sisa area transparan (yuva420p)
             filterChain.push(
                 `format=yuva420p,scale=${size}:${size}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`
             );
@@ -238,12 +267,17 @@ function renderAudioM4a(inputPath, outputPath, maxSeconds = 30) {
     });
 }
 
+// Ekstrak nomor bersih dari JID/LID WhatsApp
+function extractDigits(jid = '') {
+    return jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+}
+
 let cachedPhoneNumber = '';
 let isPairingActive = false;
 let pairingTimeout = null;
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_session');
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
     const { version } = await fetchLatestBaileysVersion();
 
     if (!state.creds.registered && !cachedPhoneNumber) {
@@ -298,8 +332,8 @@ async function startBot() {
         if (connection === 'open') {
             isPairingActive = false;
             if (pairingTimeout) clearInterval(pairingTimeout);
-            rl.close();
-            console.log('\n[SUKSES] Bot WhatsApp aktif dan siap membuat Sound Sticker!');
+            try { rl.close(); } catch (e) {}
+            console.log(`\n[SUKSES] Bot WhatsApp aktif! Mode saat ini: ${botConfig.adminOnly ? 'ADMIN ONLY (Khusus Owner)' : 'PUBLIC'}`);
         }
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -315,6 +349,20 @@ async function startBot() {
         if (!msg.message) return;
 
         const remoteJid = msg.key.remoteJid;
+        if (remoteJid === 'status@broadcast') return;
+
+        // === IDENTIFIKASI OWNER / ADMIN ===
+        const isGroup = remoteJid.endsWith('@g.us');
+        const rawSender = isGroup ? (msg.key.participant || '') : remoteJid;
+        const senderDigits = extractDigits(rawSender);
+        const botDigits = extractDigits(sock.user?.id || '');
+        const botLidDigits = extractDigits(sock.user?.lid || '');
+
+        const cleanOwners = botConfig.owners.map((n) => n.replace(/[^0-9]/g, ''));
+        const isOwner =
+            Boolean(msg.key.fromMe) ||
+            (senderDigits !== '' && (senderDigits === botDigits || senderDigits === botLidDigits || cleanOwners.includes(senderDigits)));
+
         const messageType = Object.keys(msg.message)[0];
         const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
         const quotedType = quotedMsg ? Object.keys(quotedMsg)[0] : null;
@@ -328,23 +376,58 @@ async function startBot() {
 
         const parts = caption.trim().toLowerCase().split(/\s+/);
         const baseCmd = parts[0] || '';
+
+        // === PERINTAH SAKLAR MODE (MUTLAK HANYA UNTUK OWNER) ===
+        if (baseCmd === '.adminonly' || baseCmd === '.self') {
+            if (!isOwner) return;
+            botConfig.adminOnly = true;
+            saveConfig(botConfig);
+            await sock.sendMessage(
+                remoteJid,
+                { text: '🔒 *Mode Admin Only Aktif*\nSekarang hanya kamu (Owner) yang dapat menggunakan perintah bot di grup maupun chat pribadi.' },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.public' || baseCmd === '.alluser') {
+            if (!isOwner) return;
+            botConfig.adminOnly = false;
+            saveConfig(botConfig);
+            await sock.sendMessage(
+                remoteJid,
+                { text: '🌐 *Mode Public Aktif*\nSekarang semua member dapat menggunakan perintah stiker bot.' },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        // === GERBANG FILTER AKSES: Abaikan total jika Admin Only aktif & pengirim bukan Owner ===
+        if (botConfig.adminOnly && !isOwner) {
+            return;
+        }
+
         const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
         const cropMode = validModes.includes(parts[1]) ? parts[1] : 'auto';
 
         if (baseCmd === '.menu') {
+            const statusText = botConfig.adminOnly ? '🔒 Admin Only (Khusus Owner)' : '🌐 Public (Semua Member)';
             await sock.sendMessage(
                 remoteJid,
                 {
                     text:
-                        '*Menu Bot Sound Sticker:*\n\n' +
-                        '1. *.s* → Stiker Biasa (Auto Transparan)\n' +
-                        '2. *.sa* → Sound Sticker (Auto Transparan, hingga 30 detik)\n\n' +
-                        '*Mode Potong 1:1 (Fullscreen):*\n' +
-                        '• *.sa tengah* (atau *.s tengah*) → Potong kotak 1:1 bagian tengah\n' +
-                        '• *.sa atas* → Potong kotak 1:1 bagian atas\n' +
-                        '• *.sa bawah* → Potong kotak 1:1 bagian bawah\n' +
-                        '• *.sa kiri* → Potong kotak 1:1 sisi kiri\n' +
-                        '• *.sa kanan* → Potong kotak 1:1 sisi kanan'
+                        `*Menu Bot Sound Sticker*\n` +
+                        `Status Akses: *${statusText}*\n\n` +
+                        `1. *.s* → Stiker Biasa (Auto Transparan)\n` +
+                        `2. *.sa* → Sound Sticker (Auto Transparan, hingga 30 detik)\n\n` +
+                        `*Mode Potong 1:1 (Fullscreen):*\n` +
+                        `• *.sa tengah* / *.s tengah* → Potong 1:1 tengah\n` +
+                        `• *.sa atas* / *.s atas* → Potong 1:1 atas\n` +
+                        `• *.sa bawah* / *.s bawah* → Potong 1:1 bawah\n` +
+                        `• *.sa kiri* / *.sa kanan* → Potong 1:1 kiri/kanan\n\n` +
+                        `*Kontrol Owner:*\n` +
+                        `• *.adminonly* → Kunci bot hanya untuk kamu\n` +
+                        `• *.public* → Izinkan semua orang memakai bot`
                 },
                 { quoted: msg }
             );
@@ -363,8 +446,8 @@ async function startBot() {
         // Perintah .s (Stiker Biasa + Dukungan Mode Potong 1:1)
         if (baseCmd === '.s' && targetMedia) {
             const stamp = Date.now();
-            const tempIn = path.join('./', `in_${stamp}.${isVideo ? 'mp4' : 'jpg'}`);
-            const tempWebp = path.join('./', `out_${stamp}.webp`);
+            const tempIn = path.join(__dirname, `in_${stamp}.${isVideo ? 'mp4' : 'jpg'}`);
+            const tempWebp = path.join(__dirname, `out_${stamp}.webp`);
 
             try {
                 console.log(`[PROSES] Membuat stiker .s (mode: ${cropMode})...`);
@@ -389,9 +472,9 @@ async function startBot() {
         // Perintah .sa (Sound Sticker + Dukungan Mode Potong 1:1 & Transparansi)
         if (baseCmd === '.sa' && targetMedia && isVideo) {
             const stamp = Date.now();
-            const tempIn = path.join('./', `sa_in_${stamp}.mp4`);
-            const tempWebp = path.join('./', `sa_out_${stamp}.webp`);
-            const tempM4a = path.join('./', `sa_aud_${stamp}.m4a`);
+            const tempIn = path.join(__dirname, `sa_in_${stamp}.mp4`);
+            const tempWebp = path.join(__dirname, `sa_out_${stamp}.webp`);
+            const tempM4a = path.join(__dirname, `sa_aud_${stamp}.m4a`);
 
             try {
                 console.log(`[PROSES] Mengunduh video untuk .sa (mode: ${cropMode})...`);
