@@ -197,7 +197,7 @@ function buildScaleFilter(size, cropMode, autoCrop) {
     return filterChain.join(',');
 }
 
-// Fungsi internal sekali render FFmpeg
+// Fungsi internal sekali render FFmpeg (Anti-blank untuk gambar statis & optimal untuk video)
 function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, quality, cropMode, autoCrop) {
     return new Promise((resolve, reject) => {
         const vf = buildScaleFilter(size, cropMode, autoCrop);
@@ -213,7 +213,8 @@ function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, qu
                   '-fps_mode', 'passthrough'
               ]
             : [
-                  '-vf', vf,
+                  '-vf', `${vf},format=rgba`,
+                  '-vframes', '1',
                   '-quality', '85'
               ];
 
@@ -434,23 +435,35 @@ async function startBot() {
             return;
         }
 
-        const targetMedia =
-            messageType === 'imageMessage' || messageType === 'videoMessage'
-                ? msg
-                : quotedType === 'imageMessage' || quotedType === 'videoMessage'
-                ? { key: msg.key, message: quotedMsg }
-                : null;
+        const isValidMedia = (t) => ['imageMessage', 'videoMessage', 'stickerMessage'].includes(t);
+        const targetMedia = isValidMedia(messageType)
+            ? msg
+            : isValidMedia(quotedType)
+            ? { key: msg.key, message: quotedMsg }
+            : null;
 
-        const isVideo = messageType === 'videoMessage' || quotedType === 'videoMessage';
+        const isSticker = messageType === 'stickerMessage' || quotedType === 'stickerMessage';
+        const isVideo =
+            messageType === 'videoMessage' ||
+            quotedType === 'videoMessage' ||
+            Boolean(msg.message.stickerMessage?.isAnimated || quotedMsg?.stickerMessage?.isAnimated);
 
-        // Perintah .s (Stiker Biasa + Dukungan Mode Potong 1:1)
-        if (baseCmd === '.s' && targetMedia) {
+        // Perintah .s (Stiker Biasa + Dukungan Reply Stiker + Mode Potong 1:1 + Reaksi ⏳ / ✅ / ❌)
+        if (baseCmd === '.s') {
+            if (!targetMedia) {
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                return;
+            }
+
             const stamp = Date.now();
-            const tempIn = path.join(__dirname, `in_${stamp}.${isVideo ? 'mp4' : 'jpg'}`);
+            const ext = isSticker ? 'webp' : isVideo ? 'mp4' : 'jpg';
+            const tempIn = path.join(__dirname, `in_${stamp}.${ext}`);
             const tempWebp = path.join(__dirname, `out_${stamp}.webp`);
 
             try {
                 console.log(`[PROSES] Membuat stiker .s (mode: ${cropMode})...`);
+                await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+
                 const buffer = await downloadMediaMessage(targetMedia, 'buffer', {});
                 fs.writeFileSync(tempIn, buffer);
 
@@ -459,9 +472,11 @@ async function startBot() {
                 const finalSticker = addStickerExif(fs.readFileSync(tempWebp));
 
                 await sock.sendMessage(remoteJid, { sticker: finalSticker }, { quoted: msg });
+                await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
                 console.log('[SELESAI] Stiker .s terkirim!');
             } catch (err) {
                 console.error('Detail Error .s:', err);
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .s: ${err.message}` }, { quoted: msg });
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
@@ -469,8 +484,13 @@ async function startBot() {
             }
         }
 
-        // Perintah .sa (Sound Sticker + Dukungan Mode Potong 1:1 & Transparansi)
-        if (baseCmd === '.sa' && targetMedia && isVideo) {
+        // Perintah .sa (Sound Sticker + Dukungan Mode Potong 1:1 & Transparansi + Reaksi ⏳ / ✅ / ❌)
+        if (baseCmd === '.sa') {
+            if (!targetMedia || !isVideo || isSticker) {
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                return;
+            }
+
             const stamp = Date.now();
             const tempIn = path.join(__dirname, `sa_in_${stamp}.mp4`);
             const tempWebp = path.join(__dirname, `sa_out_${stamp}.webp`);
@@ -524,6 +544,7 @@ async function startBot() {
                 console.log('[SELESAI] Sound Sticker berhasil terkirim!');
             } catch (err) {
                 console.error('Detail Error .sa:', err);
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .sa: ${err.message}` }, { quoted: msg });
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
