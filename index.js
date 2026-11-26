@@ -58,7 +58,7 @@ try {
 function loadConfig() {
     const defaultConfig = {
         adminOnly: true,
-        owners: [] // Masukkan nomor WA tambahan jika memakai 2 nomor, contoh: ["6281234567890"]
+        owners: []
     };
     try {
         if (!fs.existsSync(CONFIG_PATH)) {
@@ -125,7 +125,7 @@ function getMediaInfo(inputPath) {
     });
 }
 
-// Menyuntikkan metadata Exif standar stiker WhatsApp ke WebP
+// Menyuntikkan metadata Exif standar stiker WhatsApp ke WebP (Aman untuk WebP statis & animasi)
 function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA') {
     const jsonMetadata = {
         'sticker-pack-id': 'com.bot.soundsticker.official',
@@ -147,7 +147,40 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
     exifChunkHeader.writeUInt32LE(exifPayload.length, 4);
     const exifPad = exifPayload.length % 2 === 1 ? Buffer.from([0x00]) : Buffer.alloc(0);
 
-    const combined = Buffer.concat([webpBuffer, exifChunkHeader, exifPayload, exifPad]);
+    // Pastikan jika WebP masih memakai chunk VP8/VP8L biasa tanpa VP8X, tambahkan header VP8X agar EXIF terbaca WhatsApp
+    const chunkFourCC = webpBuffer.toString('ascii', 12, 16);
+    if (chunkFourCC === 'VP8 ' || chunkFourCC === 'VP8L') {
+        const vp8xHeader = Buffer.alloc(18);
+        vp8xHeader.write('VP8X', 0, 4, 'ascii');
+        vp8xHeader.writeUInt32LE(10, 4);
+        // Flag EXIF (0x08) + Alpha (0x10 jika VP8L)
+        vp8xHeader.writeUInt8(chunkFourCC === 'VP8L' ? 0x18 : 0x08, 8);
+        // Canvas width - 1 (511 = 0x0001FF) dan height - 1 (511 = 0x0001FF)
+        vp8xHeader.writeUIntLE(511, 12, 3);
+        vp8xHeader.writeUIntLE(511, 15, 3);
+
+        const bodyWithoutRiff = webpBuffer.subarray(12);
+        const combined = Buffer.concat([
+            Buffer.from('RIFF'),
+            Buffer.alloc(4),
+            Buffer.from('WEBP'),
+            vp8xHeader,
+            bodyWithoutRiff,
+            exifChunkHeader,
+            exifPayload,
+            exifPad
+        ]);
+        combined.writeUInt32LE(combined.length - 8, 4);
+        return combined;
+    }
+
+    // Jika sudah VP8X, aktifkan bit flag EXIF (0x08) di byte ke-20
+    const updatedWebp = Buffer.from(webpBuffer);
+    if (chunkFourCC === 'VP8X') {
+        updatedWebp[20] = updatedWebp[20] | 0x08;
+    }
+
+    const combined = Buffer.concat([updatedWebp, exifChunkHeader, exifPayload, exifPad]);
     combined.writeUInt32LE(combined.length - 8, 4);
     return combined;
 }
@@ -197,7 +230,7 @@ function buildScaleFilter(size, cropMode, autoCrop) {
     return filterChain.join(',');
 }
 
-// Fungsi internal sekali render FFmpeg (Anti-blank untuk gambar statis & optimal untuk video)
+// Fungsi internal sekali render FFmpeg
 function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, quality, cropMode, autoCrop) {
     return new Promise((resolve, reject) => {
         const vf = buildScaleFilter(size, cropMode, autoCrop);
@@ -213,7 +246,7 @@ function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, qu
                   '-fps_mode', 'passthrough'
               ]
             : [
-                  '-vf', `${vf},format=rgba`,
+                  '-vf', vf,
                   '-vframes', '1',
                   '-quality', '85'
               ];
@@ -419,8 +452,8 @@ async function startBot() {
                     text:
                         `*Menu Bot Sound Sticker*\n` +
                         `Status Akses: *${statusText}*\n\n` +
-                        `1. *.s* → Stiker Biasa (Auto Transparan)\n` +
-                        `2. *.sa* → Sound Sticker (Auto Transparan, hingga 30 detik)\n\n` +
+                        `1. *.s* → Stiker Biasa (Foto/Video, Auto Transparan)\n` +
+                        `2. *.sa* → Sound Sticker (Video, hingga 30 detik)\n\n` +
                         `*Mode Potong 1:1 (Fullscreen):*\n` +
                         `• *.sa tengah* / *.s tengah* → Potong 1:1 tengah\n` +
                         `• *.sa atas* / *.s atas* → Potong 1:1 atas\n` +
@@ -448,7 +481,7 @@ async function startBot() {
             quotedType === 'videoMessage' ||
             Boolean(msg.message.stickerMessage?.isAnimated || quotedMsg?.stickerMessage?.isAnimated);
 
-        // Perintah .s (Stiker Biasa + Dukungan Reply Stiker + Mode Potong 1:1 + Reaksi ⏳ / ✅ / ❌)
+        // Perintah .s (Stiker Biasa Foto/Video + Dukungan Reply Stiker + Mode Potong 1:1 + Reaksi ⏳ / ✅ / ❌)
         if (baseCmd === '.s') {
             if (!targetMedia) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
@@ -461,7 +494,7 @@ async function startBot() {
             const tempWebp = path.join(__dirname, `out_${stamp}.webp`);
 
             try {
-                console.log(`[PROSES] Membuat stiker .s (mode: ${cropMode})...`);
+                console.log(`[PROSES] Membuat stiker .s (mode: ${cropMode}, video: ${isVideo})...`);
                 await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
 
                 const buffer = await downloadMediaMessage(targetMedia, 'buffer', {});
