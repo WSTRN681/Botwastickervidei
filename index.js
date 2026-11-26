@@ -13,16 +13,32 @@ import pino from 'pino';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import readline from 'readline';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const SCHEDULES_PATH = path.join(__dirname, 'schedules.json');
+const CHATS_HISTORY_PATH = path.join(__dirname, 'chats_history.json');
+const PANEL_HTML_PATH = path.join(__dirname, 'panel.html');
 const SESSION_PATH = path.join(__dirname, 'auth_session');
+let activePanelPort = 8080;
 
-// === PATCH PROTOBUF STATIC ENCODER: Suntikkan Field 26 (audioMessage) ke StickerMessage ===
+const sseClients = new Set();
+function broadcastSSE(payload) {
+    const msg = `data: ${JSON.stringify(payload)}\n\n`;
+    for (const res of sseClients) {
+        try {
+            res.write(msg);
+        } catch (e) {
+            sseClients.delete(res);
+        }
+    }
+}
+
+// === PATCH PROTOBUF STATIC ENCODER ===
 try {
     const StickerMsg = proto.Message.StickerMessage;
     const AudioMsg = proto.Message.AudioMessage;
@@ -80,11 +96,59 @@ function loadConfig() {
 
 function saveConfig(cfg) {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    broadcastSSE({ type: 'user' });
 }
 
 let botConfig = loadConfig();
 
-// === MANAJEMEN SCHEDULES.JSON (PESAN TERJADWAL) ===
+// === MANAJEMEN RIWAYAT PERCAKAPAN (chats_history.json) ===
+function loadChatsHistory() {
+    try {
+        if (!fs.existsSync(CHATS_HISTORY_PATH)) {
+            fs.writeFileSync(CHATS_HISTORY_PATH, JSON.stringify([], null, 2));
+            return [];
+        }
+        const parsed = JSON.parse(fs.readFileSync(CHATS_HISTORY_PATH, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+        return [];
+    }
+}
+
+function saveChatsHistory(list) {
+    fs.writeFileSync(CHATS_HISTORY_PATH, JSON.stringify(list, null, 2));
+}
+
+let chatLogs = loadChatsHistory();
+
+function recordChat(number, pushName, contextLabel, incomingText, botReplyText) {
+    if (!number) return null;
+    const entry = {
+        id: Date.now() + Math.random(),
+        number,
+        name: pushName || 'Pengguna WA',
+        context: contextLabel,
+        time: formatWib(),
+        incoming: incomingText || '[Media]',
+        reply: botReplyText
+    };
+    chatLogs.push(entry);
+    if (chatLogs.length > 500) {
+        chatLogs = chatLogs.slice(-500);
+    }
+    saveChatsHistory(chatLogs);
+    broadcastSSE({ type: 'chat' });
+    return entry;
+}
+
+function updateChatReply(entry, newReply) {
+    if (!entry) return;
+    entry.reply = newReply;
+    saveChatsHistory(chatLogs);
+    broadcastSSE({ type: 'chat' });
+}
+
+// === MANAJEMEN SCHEDULES.JSON ===
 function loadSchedules() {
     try {
         if (!fs.existsSync(SCHEDULES_PATH)) {
@@ -106,17 +170,13 @@ let schedules = loadSchedules();
 let activeSock = null;
 let isSchedulerTickRunning = false;
 
-// === FUNGSI NORMALISASI NOMOR (+62 812-xxx, 0812xxx, 62812xxx) ===
 function normalizePhoneNumber(rawInput) {
     let digits = String(rawInput || '').replace(/[^0-9]/g, '');
     if (!digits) return '';
-    if (digits.startsWith('0')) {
-        digits = '62' + digits.slice(1);
-    }
+    if (digits.startsWith('0')) digits = '62' + digits.slice(1);
     return digits;
 }
 
-// === PARSER CERDAS .JADWAL ===
 function parseJadwalInput(rawText) {
     const hasFormLabels = /(nomor|nama|waktu|tanggal|waktu\/tanggal|jam|pesan)\s*:/i.test(rawText);
 
@@ -172,7 +232,6 @@ function parseJadwalInput(rawText) {
     return { nomor: '', waktu: '', jumlah: '1', pesan: '' };
 }
 
-// === FUNGSI WAKTU REALTIME WIB ===
 function getWibParts(timestamp = Date.now()) {
     const dtf = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'Asia/Jakarta',
@@ -258,7 +317,6 @@ function parseScheduleTime(input) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Mesin pengecek jadwal realtime
 setInterval(async () => {
     if (!activeSock || isSchedulerTickRunning) return;
     const now = Date.now();
@@ -307,6 +365,137 @@ setInterval(async () => {
         isSchedulerTickRunning = false;
     }
 }, 1000);
+
+// === WEB SERVER PANEL LOKAL DENGAN AUTO-PORT ===
+const panelServer = http.createServer((req, res) => {
+    const url = req.url.split('?')[0];
+
+    if (req.method === 'GET' && url === '/') {
+        if (fs.existsSync(PANEL_HTML_PATH)) {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(fs.readFileSync(PANEL_HTML_PATH, 'utf8'));
+        } else {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('File panel.html tidak ditemukan.');
+        }
+        return;
+    }
+
+    if (req.method === 'GET' && url === '/api/stream') {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive'
+        });
+        sseClients.add(res);
+        req.on('close', () => sseClients.delete(res));
+        return;
+    }
+
+    if (req.method === 'GET' && url === '/api/state') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+            JSON.stringify({
+                connected: Boolean(activeSock),
+                adminOnly: botConfig.adminOnly,
+                wibTime: formatWib(),
+                activeSchedules: schedules.filter((j) => j.status === 'ACTIVE').length,
+                owners: botConfig.owners.map((n) => normalizePhoneNumber(n)),
+                allowedUsers: botConfig.allowedUsers.map((n) => normalizePhoneNumber(n)),
+                chats: chatLogs
+            })
+        );
+        return;
+    }
+
+    if (req.method === 'GET' && url === '/api/code') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8') }));
+        return;
+    }
+
+    if (req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', () => {
+            try {
+                const payload = body ? JSON.parse(body) : {};
+
+                if (url === '/api/toggle-mode') {
+                    botConfig.adminOnly = !botConfig.adminOnly;
+                    saveConfig(botConfig);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, adminOnly: botConfig.adminOnly }));
+                    return;
+                }
+
+                if (url === '/api/clear-chats') {
+                    chatLogs = [];
+                    saveChatsHistory(chatLogs);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true }));
+                    return;
+                }
+
+                if (url === '/api/code' && payload.code) {
+                    fs.writeFileSync(path.join(__dirname, 'index.js'), payload.code, 'utf8');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true }));
+                    return;
+                }
+
+                if (url === '/api/restart') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true }));
+                    panelServer.close();
+                    setTimeout(() => {
+                        spawn(process.argv[0], process.argv.slice(1), {
+                            cwd: __dirname,
+                            detached: true,
+                            stdio: 'inherit'
+                        }).unref();
+                        process.exit(0);
+                    }, 500);
+                    return;
+                }
+
+                if (url === '/api/stop') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true }));
+                    setTimeout(() => process.exit(0), 400);
+                    return;
+                }
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+                return;
+            }
+            res.writeHead(404);
+            res.end();
+        });
+        return;
+    }
+
+    res.writeHead(404);
+    res.end();
+});
+
+function startPanelServer(port) {
+    activePanelPort = port;
+    panelServer.listen(port, '0.0.0.0');
+}
+
+panelServer.on('listening', () => {
+    console.log(`[PANEL] Web Monitor aktif di: http://localhost:${activePanelPort}`);
+});
+
+panelServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        startPanelServer(activePanelPort + 1);
+    }
+});
+
+startPanelServer(8080);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
@@ -605,7 +794,6 @@ async function startBot() {
         const botDigits = extractDigits(sock.user?.id || '');
         const botLidDigits = extractDigits(sock.user?.lid || '');
 
-        // Resolve nomor pengirim (mendukung LID & Pn)
         const rawCandidate = isGroup
             ? (msg.key.participantPn || msg.key.participant || '')
             : (msg.key.senderPn || remoteJid);
@@ -624,7 +812,6 @@ async function startBot() {
 
         const isAllowedUser = isOwner || (senderDigits !== '' && cleanAllowedUsers.includes(senderDigits));
 
-        // Cek apakah chat ini adalah Self-Chat (nomor sendiri / Saved Messages)
         const remoteDigits = extractDigits(remoteJid);
         const isSelfChat =
             !isGroup &&
@@ -644,6 +831,25 @@ async function startBot() {
         const parts = caption.trim().split(/\s+/);
         const baseCmd = (parts[0] || '').toLowerCase();
 
+        // === CATAT RIWAYAT PERCAKAPAN UNTUK WEB MONITOR ===
+        let chatEntry = null;
+        if (senderDigits && !isEdited) {
+            const isCommandOrPrivate = !isGroup || caption.trim().startsWith('.');
+            if (isCommandOrPrivate) {
+                const contextLabel = isGroup ? 'Grup' : isSelfChat ? 'Self-Chat' : 'Chat Pribadi';
+                const initialStatus = (botConfig.adminOnly && !isAllowedUser)
+                    ? '[Diabaikan: Belum terdaftar di .add]'
+                    : 'Diproses oleh bot';
+                chatEntry = recordChat(
+                    senderDigits,
+                    msg.pushName || (isOwner ? 'Admin / Owner' : 'Pengguna WA'),
+                    contextLabel,
+                    caption.trim() || `[${messageType}]`,
+                    initialStatus
+                );
+            }
+        }
+
         // === PERINTAH MANAJEMEN PENGGUNA & ADMIN MANUAL (.add, .del, .listuser) ===
         if (baseCmd === '.add') {
             if (!isOwner) return;
@@ -652,7 +858,6 @@ async function startBot() {
             const isAddingAdmin = arg1 === 'admin' || arg1 === 'owner';
             const rawNumInput = isAddingAdmin ? parts.slice(2).join('') : parts.slice(1).join('');
 
-            // Jika tanpa nomor, cek apakah me-reply pesan seseorang
             let targetNum = normalizePhoneNumber(rawNumInput);
             if (!targetNum) {
                 const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
@@ -677,18 +882,15 @@ async function startBot() {
             }
 
             if (isAddingAdmin) {
-                if (!cleanOwners.includes(targetNum)) {
-                    botConfig.owners.push(targetNum);
-                }
-                if (!cleanAllowedUsers.includes(targetNum)) {
-                    botConfig.allowedUsers.push(targetNum);
-                }
+                if (!cleanOwners.includes(targetNum)) botConfig.owners.push(targetNum);
+                if (!cleanAllowedUsers.includes(targetNum)) botConfig.allowedUsers.push(targetNum);
                 saveConfig(botConfig);
                 await sock.sendMessage(
                     remoteJid,
                     { text: `👑 Nomor *+${targetNum}* berhasil ditambahkan sebagai *Admin/Owner* secara permanen.` },
                     { quoted: msg }
                 );
+                updateChatReply(chatEntry, `Menambahkan Admin +${targetNum}`);
             } else {
                 if (cleanAllowedUsers.includes(targetNum)) {
                     await sock.sendMessage(
@@ -705,6 +907,7 @@ async function startBot() {
                     { text: `✅ Nomor *+${targetNum}* berhasil ditambahkan ke daftar pengguna permanen.` },
                     { quoted: msg }
                 );
+                updateChatReply(chatEntry, `Menambahkan Pengguna +${targetNum}`);
             }
             return;
         }
@@ -748,6 +951,7 @@ async function startBot() {
                 { text: `🗑️ Nomor *+${targetNum}* berhasil dihapus dari daftar Admin & Pengguna.` },
                 { quoted: msg }
             );
+            updateChatReply(chatEntry, `Menghapus nomor +${targetNum}`);
             return;
         }
 
@@ -774,10 +978,11 @@ async function startBot() {
                 },
                 { quoted: msg }
             );
+            updateChatReply(chatEntry, 'Menampilkan .listuser');
             return;
         }
 
-        // === PERINTAH SAKLAR MODE (MUTLAK HANYA UNTUK ADMIN/OWNER) ===
+        // === PERINTAH SAKLAR MODE ===
         if (baseCmd === '.adminonly' || baseCmd === '.self') {
             if (!isOwner) return;
             botConfig.adminOnly = true;
@@ -787,6 +992,7 @@ async function startBot() {
                 { text: '🔒 *Mode Admin Only Aktif*\nHanya Admin dan nomor yang terdaftar di *.add* yang dapat memakai bot.' },
                 { quoted: msg }
             );
+            updateChatReply(chatEntry, 'Mengaktifkan Mode Admin Only');
             return;
         }
 
@@ -799,10 +1005,11 @@ async function startBot() {
                 { text: '🌐 *Mode Public Aktif*\nSemua member sekarang dapat menggunakan perintah stiker bot.' },
                 { quoted: msg }
             );
+            updateChatReply(chatEntry, 'Mengaktifkan Mode Public');
             return;
         }
 
-        // === FITUR PESAN TERJADWAL (KHUSUS ADMIN/OWNER) ===
+        // === FITUR PESAN TERJADWAL ===
         if (baseCmd === '.jam') {
             if (!isOwner) return;
             const activeCount = schedules.filter((j) => j.status === 'ACTIVE').length;
@@ -811,6 +1018,7 @@ async function startBot() {
                 { text: `🕒 *Waktu Realtime Bot:*\n${formatWib()}\nAntrean jadwal aktif: *${activeCount}*` },
                 { quoted: msg }
             );
+            updateChatReply(chatEntry, `Cek jam (${formatWib()})`);
             return;
         }
 
@@ -836,6 +1044,7 @@ async function startBot() {
                     },
                     { quoted: msg }
                 );
+                updateChatReply(chatEntry, 'Mengirim templat formulir .jadwal');
                 return;
             }
 
@@ -849,6 +1058,7 @@ async function startBot() {
                     { text: `⚠️ *Formulir belum lengkap!*\nPastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\nKetik *.jadwal* tanpa teks untuk templat kosong.` },
                     { quoted: msg }
                 );
+                updateChatReply(chatEntry, 'Gagal .jadwal: Formulir belum lengkap');
                 return;
             }
 
@@ -960,6 +1170,7 @@ async function startBot() {
                 { quoted: msg }
             );
             await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+            updateChatReply(chatEntry, `Jadwal #${newJob.id} dibuat untuk ${targetLabel} (${scheduledText})`);
             return;
         }
 
@@ -1080,7 +1291,7 @@ async function startBot() {
 
         if (isEdited) return;
 
-        // === GERBANG FILTER AKSES: Jika Admin Only aktif, hanya Admin & nomor di .add yang bisa akses ===
+        // === GERBANG FILTER AKSES ===
         if (botConfig.adminOnly && !isAllowedUser) {
             return;
         }
@@ -1089,7 +1300,7 @@ async function startBot() {
         const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
         const cropMode = validModes.includes(cropArg) ? cropArg : 'auto';
 
-        // === MENU DINAMIS: Fitur Admin HANYA muncul jika Admin mengetik .menu di nomor sendiri ===
+        // === MENU DINAMIS ===
         if (baseCmd === '.menu') {
             let menuText =
                 `*BOT SOUND STICKER*\n\n` +
@@ -1103,7 +1314,8 @@ async function startBot() {
                 const statusText = botConfig.adminOnly ? '🔒 Admin Only' : '🌐 Public';
                 menuText +=
                     `\n\n━━━━━━━━━━━━━━━━━━\n` +
-                    `👑 *MENU KHUSUS ADMIN* (${statusText})\n\n` +
+                    `👑 *MENU KHUSUS ADMIN* (${statusText})\n` +
+                    `🌐 Web Monitor: *http://localhost:${activePanelPort}*\n\n` +
                     `*1. Manajemen Pengguna (.add):*\n` +
                     `• *.add* 0812xxx → Tambah pengguna permanen\n` +
                     `• *.add admin* 0812xxx → Tambah admin permanen\n` +
@@ -1121,6 +1333,7 @@ async function startBot() {
             }
 
             await sock.sendMessage(remoteJid, { text: menuText }, { quoted: msg });
+            updateChatReply(chatEntry, 'Mengirim daftar .menu');
             return;
         }
 
@@ -1141,6 +1354,7 @@ async function startBot() {
         if (baseCmd === '.s') {
             if (!targetMedia) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                updateChatReply(chatEntry, 'Gagal .s: Tidak ada media dilampirkan');
                 return;
             }
 
@@ -1162,11 +1376,13 @@ async function startBot() {
 
                 await sock.sendMessage(remoteJid, { sticker: finalSticker }, { quoted: msg });
                 await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                updateChatReply(chatEntry, `Berhasil membuat stiker (.s ${cropMode})`);
                 console.log('[SELESAI] Stiker .s terkirim!');
             } catch (err) {
                 console.error('Detail Error .s:', err);
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .s: ${err.message}` }, { quoted: msg });
+                updateChatReply(chatEntry, `Error .s: ${err.message}`);
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
                 if (fs.existsSync(tempWebp)) fs.unlinkSync(tempWebp);
@@ -1177,6 +1393,7 @@ async function startBot() {
         if (baseCmd === '.sa') {
             if (!targetMedia || !isVideo || isSticker) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                updateChatReply(chatEntry, 'Gagal .sa: Wajib melampirkan video');
                 return;
             }
 
@@ -1230,11 +1447,13 @@ async function startBot() {
 
                 await sock.relayMessage(remoteJid, waMsg.message, { messageId: waMsg.key.id });
                 await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                updateChatReply(chatEntry, `Berhasil membuat Sound Sticker (.sa ${cropMode})`);
                 console.log('[SELESAI] Sound Sticker berhasil terkirim!');
             } catch (err) {
                 console.error('Detail Error .sa:', err);
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .sa: ${err.message}` }, { quoted: msg });
+                updateChatReply(chatEntry, `Error .sa: ${err.message}`);
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
                 if (fs.existsSync(tempWebp)) fs.unlinkSync(tempWebp);
