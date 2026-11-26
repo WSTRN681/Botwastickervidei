@@ -8,3 +8,4 @@ auth_session/
 .env
 config.json
 schedules.json
+users_history.json
