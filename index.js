@@ -104,6 +104,53 @@ let schedules = loadSchedules();
 let activeSock = null;
 let isSchedulerTickRunning = false;
 
+// === FUNGSI NORMALISASI NOMOR (+62 123-456-789, 0123456789, 62123456789) ===
+function normalizePhoneNumber(rawInput) {
+    let digits = String(rawInput || '').replace(/[^0-9]/g, '');
+    if (!digits) return '';
+    if (digits.startsWith('0')) {
+        digits = '62' + digits.slice(1);
+    }
+    return digits;
+}
+
+// === PARSER FORMULIR .JADWAL (BARIS PER BARIS) ===
+function parseJadwalForm(rawText) {
+    const lines = rawText.split(/\r?\n/);
+    const data = {
+        nomor: '',
+        waktu: '',
+        jumlah: '1',
+        pesan: ''
+    };
+
+    let currentField = null;
+    const messageLines = [];
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (/^nomor\s*:/i.test(trimmed)) {
+            currentField = 'nomor';
+            data.nomor = trimmed.replace(/^nomor\s*:/i, '').trim();
+        } else if (/^(waktu|tanggal|waktu\/tanggal|jam)\s*:/i.test(trimmed)) {
+            currentField = 'waktu';
+            data.waktu = trimmed.replace(/^(waktu|tanggal|waktu\/tanggal|jam)\s*:/i, '').trim();
+        } else if (/^jumlah\s*:/i.test(trimmed)) {
+            currentField = 'jumlah';
+            data.jumlah = trimmed.replace(/^jumlah\s*:/i, '').trim() || '1';
+        } else if (/^pesan\s*:/i.test(trimmed)) {
+            currentField = 'pesan';
+            const firstMsgLine = line.replace(/^\s*pesan\s*:\s*/i, '');
+            if (firstMsgLine.trim() !== '') messageLines.push(firstMsgLine);
+        } else if (currentField === 'pesan') {
+            messageLines.push(line);
+        }
+    }
+
+    data.pesan = messageLines.join('\n').trim();
+    return data;
+}
+
 // === FUNGSI WAKTU REALTIME WIB (Asia/Jakarta, UTC+7) ===
 function getWibParts(timestamp = Date.now()) {
     const dtf = new Intl.DateTimeFormat('en-GB', {
@@ -169,7 +216,7 @@ function parseScheduleTime(input) {
         const isoStr = `${p.year}-${p.month}-${p.day}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00+07:00`;
         let targetTs = Date.parse(isoStr);
         if (targetTs <= now) {
-            targetTs += 24 * 60 * 60 * 1000; // Otomatis besok jika jam hari ini sudah lewat
+            targetTs += 24 * 60 * 60 * 1000;
         }
         return targetTs;
     }
@@ -619,38 +666,56 @@ async function startBot() {
 
         if (baseCmd === '.jadwal') {
             if (!isOwner) return;
-            const rawArgs = caption.slice(parts[0].length).trim();
-            const segs = rawArgs.split('|').map((s) => s.trim());
+            const rawBody = caption.slice(parts[0].length).trim();
 
-            if (segs.length < 4 || !segs[0] || !segs[1] || !segs[2] || !segs[3]) {
+            // Jika diketik ".jadwal" saja tanpa isi, kirim templat formulir siap copy-paste
+            if (!rawBody) {
                 await sock.sendMessage(
                     remoteJid,
                     {
                         text:
-                            `⚠️ *Format salah!*\n` +
-                            `Gunakan: *.jadwal nomor | waktu | jumlah | pesan*\n\n` +
-                            `Contoh:\n` +
-                            `• *.jadwal 6281234567890 | 20:30 | 1 | Halo!*\n` +
-                            `• *.jadwal 6281234567890 | +15m | 3:10 | Rapat mulai!*\n` +
-                            `• *.jadwal sini | 27-11-2026 07:00 | 1 | Pagi semua!*`
+                            `.jadwal\n` +
+                            `Nomor: +62 812-3456-7890\n` +
+                            `Waktu: 20:30\n` +
+                            `Jumlah: 1\n` +
+                            `Pesan: Halo, ini pesan terjadwal!`
                     },
                     { quoted: msg }
                 );
                 return;
             }
 
-            const [targetInput, timeInput, countInput, ...msgRest] = segs;
-            const messageText = msgRest.join(' | ');
+            const form = parseJadwalForm(rawBody);
+
+            if (!form.nomor || !form.waktu || !form.pesan) {
+                await sock.sendMessage(
+                    remoteJid,
+                    {
+                        text:
+                            `⚠️ *Formulir belum lengkap!*\n` +
+                            `Pastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\n\n` +
+                            `Contoh format:\n` +
+                            `.jadwal\n` +
+                            `Nomor: +62 812-3456-7890\n` +
+                            `Waktu: 20:30\n` +
+                            `Jumlah: 3:10\n` +
+                            `Pesan: Jangan lupa rapat!\n\n` +
+                            `_Catatan: Nomor bisa diisi "sini" untuk kirim ke chat/grup ini._`
+                    },
+                    { quoted: msg }
+                );
+                return;
+            }
 
             // Validasi Waktu
-            const targetTs = parseScheduleTime(timeInput);
+            const targetTs = parseScheduleTime(form.waktu);
             if (!targetTs) {
                 await sock.sendMessage(
                     remoteJid,
                     {
                         text:
-                            `❌ *Format waktu tidak valid atau sudah terlewat!*\n` +
-                            `Gunakan salah satu format berikut:\n` +
+                            `❌ *Format Waktu tidak valid atau sudah lewat!*\n` +
+                            `Gunakan salah satu format:\n` +
                             `• *20:30* (jam WIB hari ini/besok)\n` +
                             `• *27-11-2026 07:00* (tanggal & jam WIB)\n` +
                             `• *+15m* / *+2h* (hitung mundur menit/jam)`
@@ -660,12 +725,12 @@ async function startBot() {
                 return;
             }
 
-            // Validasi Jumlah & Jeda (contoh: "3" -> 3 pesan jeda 5d, atau "3:60" -> 3 pesan jeda 60d)
-            const countMatch = countInput.match(/^(\d+)(?::(\d+))?$/);
+            // Validasi Jumlah & Jeda (contoh: "1", "3", atau "3:60")
+            const countMatch = form.jumlah.match(/^(\d+)(?::(\d+))?$/);
             if (!countMatch) {
                 await sock.sendMessage(
                     remoteJid,
-                    { text: '❌ *Format jumlah salah!* Contoh: *1*, *3* (jeda 5 detik), atau *3:60* (3 pesan, jeda 60 detik).' },
+                    { text: '❌ *Format Jumlah salah!* Contoh: *1*, *3* (jeda 5 detik), atau *3:60* (3 pesan, jeda 60 detik).' },
                     { quoted: msg }
                 );
                 return;
@@ -677,7 +742,7 @@ async function startBot() {
             if (totalCount < 1 || totalCount > 15) {
                 await sock.sendMessage(
                     remoteJid,
-                    { text: '❌ Jumlah pesan per jadwal harus antara *1 sampai 15 pesan* demi keamanan akun.' },
+                    { text: '❌ *Jumlah:* harus antara *1 sampai 15 pesan* demi keamanan akun.' },
                     { quoted: msg }
                 );
                 return;
@@ -686,26 +751,27 @@ async function startBot() {
             if (intervalSec < 3) {
                 await sock.sendMessage(
                     remoteJid,
-                    { text: '❌ Jeda antar-pesan minimal *3 detik* (contoh: *3:5*) agar tidak terdeteksi spam.' },
+                    { text: '❌ Jeda antar-pesan minimal *3 detik* (contoh: *3:5*) agar aman dari deteksi spam.' },
                     { quoted: msg }
                 );
                 return;
             }
 
-            // Validasi Nomor Tujuan
+            // Validasi & Normalisasi Nomor Tujuan (+62 123-456-789, 0123456789, 62123456789)
             let targetJid = '';
             let targetLabel = '';
 
-            if (targetInput.toLowerCase() === 'sini' || targetInput.toLowerCase() === 'here') {
+            if (form.nomor.toLowerCase() === 'sini' || form.nomor.toLowerCase() === 'here') {
                 targetJid = remoteJid;
                 targetLabel = isGroup ? 'Grup Ini' : 'Chat Ini';
             } else {
-                let cleanNum = targetInput.replace(/[^0-9]/g, '');
-                if (cleanNum.startsWith('08')) {
-                    cleanNum = '62' + cleanNum.slice(1);
-                }
+                const cleanNum = normalizePhoneNumber(form.nomor);
                 if (cleanNum.length < 9) {
-                    await sock.sendMessage(remoteJid, { text: '❌ Nomor tujuan tidak valid. Gunakan awalan 62 atau 08.' }, { quoted: msg });
+                    await sock.sendMessage(
+                        remoteJid,
+                        { text: '❌ *Nomor:* tidak valid. Pastikan panjang nomor benar.' },
+                        { quoted: msg }
+                    );
                     return;
                 }
 
@@ -736,7 +802,7 @@ async function startBot() {
                 targetJid,
                 targetLabel,
                 notifyJid: ownerNotifyJid,
-                message: messageText,
+                message: form.pesan,
                 createdAt: formatWib(Date.now()),
                 scheduledAt: targetTs,
                 nextRunAt: targetTs,
@@ -761,7 +827,7 @@ async function startBot() {
                         `• Waktu Kirim: *${scheduledText}*\n` +
                         `• Hitung Mundur: *${sisaWaktu}*\n` +
                         `• Jumlah: *${totalCount} pesan* (jeda ${intervalSec} detik)\n` +
-                        `• Isi: _"${messageText}"_\n\n` +
+                        `• Pesan: _"${form.pesan}"_\n\n` +
                         `Ketik *.listjadwal* untuk cek hitung mundur atau *.stopjadwal ${newJob.id}* untuk batal.`
                 },
                 { quoted: msg }
@@ -918,9 +984,11 @@ async function startBot() {
                         `• *.s* / *.sa* → Stiker foto/video (auto transparan)\n` +
                         `• *.s tengah* / *.sa tengah* → Potong 1:1 (tengah/atas/bawah/kiri/kanan)\n\n` +
                         `*2. Pesan Terjadwal (Owner)*\n` +
-                        `• *.jadwal* nomor | waktu | jumlah | pesan\n` +
-                        `  _Waktu: 20:30 / 27-11-2026 07:00 / +15m_\n` +
-                        `  _Jumlah: 3 (jeda 5d) atau 3:60 (jeda 60d)_\n` +
+                        `• *.jadwal* (ketik saja untuk templat)\n` +
+                        `  Nomor: +62 812-xxx / 0812xxx / sini\n` +
+                        `  Waktu: 20:30 / 27-11-2026 07:00 / +15m\n` +
+                        `  Jumlah: 1 atau 3:10 (3 pesan, jeda 10d)\n` +
+                        `  Pesan: isi pesan\n` +
                         `• *.listjadwal* → Cek antrean & hitung mundur\n` +
                         `• *.stopjadwal* id / all → Hentikan jadwal\n` +
                         `• *.riwayatjadwal* → Catatan terkirim & berhenti\n` +
