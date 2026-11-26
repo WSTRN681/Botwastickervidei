@@ -9,3 +9,4 @@ auth_session/
 config.json
 schedules.json
 users_history.json
+chats_history.json
