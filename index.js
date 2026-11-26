@@ -55,11 +55,12 @@ try {
     console.log('[WARN] Gagal patch Protobuf:', e.message);
 }
 
-// === MANAJEMEN CONFIG.JSON (ADMIN ONLY & OWNER) ===
+// === MANAJEMEN CONFIG.JSON (ADMIN, ALLOWED USERS, MODE) ===
 function loadConfig() {
     const defaultConfig = {
         adminOnly: true,
-        owners: []
+        owners: [],
+        allowedUsers: []
     };
     try {
         if (!fs.existsSync(CONFIG_PATH)) {
@@ -69,7 +70,8 @@ function loadConfig() {
         const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
         return {
             adminOnly: typeof parsed.adminOnly === 'boolean' ? parsed.adminOnly : true,
-            owners: Array.isArray(parsed.owners) ? parsed.owners : []
+            owners: Array.isArray(parsed.owners) ? parsed.owners : [],
+            allowedUsers: Array.isArray(parsed.allowedUsers) ? parsed.allowedUsers : []
         };
     } catch (err) {
         return defaultConfig;
@@ -104,7 +106,7 @@ let schedules = loadSchedules();
 let activeSock = null;
 let isSchedulerTickRunning = false;
 
-// === FUNGSI NORMALISASI NOMOR (+62 123-456-789, 0123456789, 62123456789) ===
+// === FUNGSI NORMALISASI NOMOR (+62 812-xxx, 0812xxx, 62812xxx) ===
 function normalizePhoneNumber(rawInput) {
     let digits = String(rawInput || '').replace(/[^0-9]/g, '');
     if (!digits) return '';
@@ -114,11 +116,10 @@ function normalizePhoneNumber(rawInput) {
     return digits;
 }
 
-// === PARSER CERDAS .JADWAL (MENDUKUNG FORMULIR KE BAWAH & SEBARIS KOMA/GARIS) ===
+// === PARSER CERDAS .JADWAL ===
 function parseJadwalInput(rawText) {
     const hasFormLabels = /(nomor|nama|waktu|tanggal|waktu\/tanggal|jam|pesan)\s*:/i.test(rawText);
 
-    // Mode A: Format Formulir Baris per Baris
     if (hasFormLabels) {
         const lines = rawText.split(/\r?\n/);
         const data = { nomor: '', waktu: '', jumlah: '1', pesan: '' };
@@ -127,12 +128,10 @@ function parseJadwalInput(rawText) {
 
         for (const line of lines) {
             const trimmed = line.trim();
-            // Abaikan baris keterangan jika pengguna ikut menyalin seluruh pesan templat
             if (/^_?keterangan\s*:/i.test(trimmed) || /^•/.test(trimmed)) {
                 currentField = null;
                 continue;
             }
-
             if (/^(nomor|nama)\s*:/i.test(trimmed)) {
                 currentField = 'nomor';
                 data.nomor = trimmed.replace(/^(nomor|nama)\s*:/i, '').trim();
@@ -150,12 +149,10 @@ function parseJadwalInput(rawText) {
                 messageLines.push(line);
             }
         }
-
         data.pesan = messageLines.join('\n').trim();
         return data;
     }
 
-    // Mode B: Format Sebaris Cepat (.jadwal 081234..., 12:30, 1, pesan atau pakai |)
     const separator = rawText.includes('|') ? '|' : ',';
     const segs = rawText.split(separator).map((s) => s.trim());
 
@@ -169,18 +166,13 @@ function parseJadwalInput(rawText) {
     }
 
     if (segs.length === 3) {
-        return {
-            nomor: segs[0] || '',
-            waktu: segs[1] || '',
-            jumlah: '1',
-            pesan: segs[2] || ''
-        };
+        return { nomor: segs[0] || '', waktu: segs[1] || '', jumlah: '1', pesan: segs[2] || '' };
     }
 
     return { nomor: '', waktu: '', jumlah: '1', pesan: '' };
 }
 
-// === FUNGSI WAKTU REALTIME WIB (Asia/Jakarta, UTC+7) ===
+// === FUNGSI WAKTU REALTIME WIB ===
 function getWibParts(timestamp = Date.now()) {
     const dtf = new Intl.DateTimeFormat('en-GB', {
         timeZone: 'Asia/Jakarta',
@@ -224,7 +216,6 @@ function parseScheduleTime(input) {
     const clean = input.trim().toLowerCase();
     const now = Date.now();
 
-    // Mode 1: Hitung mundur relatif (+15m, +2h, +30s)
     const relMatch = clean.match(/^\+(\d+)([smh])$/);
     if (relMatch) {
         const val = Number(relMatch[1]);
@@ -234,7 +225,6 @@ function parseScheduleTime(input) {
         return now + val * mult;
     }
 
-    // Mode 2: Jam hari ini (HH:mm)
     const timeOnlyMatch = clean.match(/^(\d{1,2}):(\d{2})$/);
     if (timeOnlyMatch) {
         const hh = Number(timeOnlyMatch[1]);
@@ -244,13 +234,10 @@ function parseScheduleTime(input) {
         const p = getWibParts(now);
         const isoStr = `${p.year}-${p.month}-${p.day}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00+07:00`;
         let targetTs = Date.parse(isoStr);
-        if (targetTs <= now) {
-            targetTs += 24 * 60 * 60 * 1000;
-        }
+        if (targetTs <= now) targetTs += 24 * 60 * 60 * 1000;
         return targetTs;
     }
 
-    // Mode 3: Tanggal & Jam spesifik (DD-MM-YYYY HH:mm)
     const fullMatch = clean.match(/^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2}):(\d{2})$/);
     if (fullMatch) {
         const dd = String(fullMatch[1]).padStart(2, '0');
@@ -271,7 +258,7 @@ function parseScheduleTime(input) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Mesin pengecek jadwal realtime setiap 1 detik
+// Mesin pengecek jadwal realtime
 setInterval(async () => {
     if (!activeSock || isSchedulerTickRunning) return;
     const now = Date.now();
@@ -282,7 +269,6 @@ setInterval(async () => {
     try {
         for (const job of dueJobs) {
             if (job.status !== 'ACTIVE') continue;
-
             try {
                 await activeSock.sendPresenceUpdate('composing', job.targetJid);
                 await sleep(1200);
@@ -297,14 +283,9 @@ setInterval(async () => {
                     job.status = 'COMPLETED';
                     job.completedAt = sentTime;
                     saveSchedules(schedules);
-
                     if (job.notifyJid) {
                         await activeSock.sendMessage(job.notifyJid, {
-                            text:
-                                `✅ *Jadwal #${job.id} Selesai*\n` +
-                                `Nomor: ${job.targetLabel}\n` +
-                                `Terkirim: *${job.sentCount}/${job.totalCount} pesan*\n` +
-                                `Selesai pada: ${sentTime}`
+                            text: `✅ *Jadwal #${job.id} Selesai*\nNomor: ${job.targetLabel}\nTerkirim: *${job.sentCount}/${job.totalCount} pesan*\nSelesai pada: ${sentTime}`
                         });
                     }
                 } else {
@@ -315,7 +296,6 @@ setInterval(async () => {
                 job.status = 'FAILED';
                 job.logs.push(`${formatWib(Date.now())} - Gagal: ${err.message}`);
                 saveSchedules(schedules);
-
                 if (job.notifyJid) {
                     await activeSock.sendMessage(job.notifyJid, {
                         text: `❌ *Jadwal #${job.id} Gagal*\nNomor: ${job.targetLabel}\nAlasan: ${err.message}`
@@ -331,7 +311,6 @@ setInterval(async () => {
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-// Deteksi durasi sekaligus cek bingkai hitam bawaan pada pertengahan video
 function getMediaInfo(inputPath) {
     return new Promise((resolve) => {
         ffmpeg.ffprobe(inputPath, (err, metadata) => {
@@ -372,7 +351,6 @@ function getMediaInfo(inputPath) {
     });
 }
 
-// Menyuntikkan metadata Exif standar stiker WhatsApp ke WebP
 function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA') {
     const jsonMetadata = {
         'sticker-pack-id': 'com.bot.soundsticker.official',
@@ -428,7 +406,6 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
     return combined;
 }
 
-// Membangun filter potong 1:1 sesuai posisi yang diminta (tengah, atas, bawah, kiri, kanan) atau auto-transparan
 function buildScaleFilter(size, cropMode, autoCrop) {
     let filterChain = [];
 
@@ -473,7 +450,6 @@ function buildScaleFilter(size, cropMode, autoCrop) {
     return filterChain.join(',');
 }
 
-// Fungsi internal sekali render FFmpeg
 function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, quality, cropMode, autoCrop) {
     return new Promise((resolve, reject) => {
         const vf = buildScaleFilter(size, cropMode, autoCrop);
@@ -503,7 +479,6 @@ function runFfmpegWebp(inputPath, outputPath, isVideo, maxSeconds, size, fps, qu
     });
 }
 
-// Konversi foto/video menjadi WebP dengan Auto-Shrink agar selalu < 900 KB
 async function renderWebp(inputPath, outputPath, isVideo = false, maxSeconds = 10, cropMode = 'auto', autoCrop = null) {
     if (!isVideo) {
         return runFfmpegWebp(inputPath, outputPath, false, 1, 512, 1, 85, cropMode, autoCrop);
@@ -527,7 +502,6 @@ async function renderWebp(inputPath, outputPath, isVideo = false, maxSeconds = 1
     return outputPath;
 }
 
-// Ekstrak audio ke AAC/M4A sesuai durasi penuh video
 function renderAudioM4a(inputPath, outputPath, maxSeconds = 30) {
     return new Promise((resolve, reject) => {
         ffmpeg(inputPath)
@@ -544,7 +518,6 @@ function renderAudioM4a(inputPath, outputPath, maxSeconds = 30) {
     });
 }
 
-// Ekstrak nomor bersih dari JID/LID WhatsApp
 function extractDigits(jid = '') {
     return jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
 }
@@ -622,24 +595,40 @@ async function startBot() {
         }
     });
 
-    // === HANDLER UTAMA PESAN MASUK & PESAN YANG DIEDIT ===
     async function handleIncomingMessage(msg, isEdited = false) {
         if (!msg || !msg.message) return;
 
         const remoteJid = msg.key?.remoteJid;
         if (!remoteJid || remoteJid === 'status@broadcast') return;
 
-        // Identifikasi Owner / Admin
         const isGroup = remoteJid.endsWith('@g.us');
-        const rawSender = isGroup ? (msg.key.participant || '') : remoteJid;
-        const senderDigits = extractDigits(rawSender);
         const botDigits = extractDigits(sock.user?.id || '');
         const botLidDigits = extractDigits(sock.user?.lid || '');
 
-        const cleanOwners = botConfig.owners.map((n) => n.replace(/[^0-9]/g, ''));
+        // Resolve nomor pengirim (mendukung LID & Pn)
+        const rawCandidate = isGroup
+            ? (msg.key.participantPn || msg.key.participant || '')
+            : (msg.key.senderPn || remoteJid);
+
+        let senderDigits = extractDigits(rawCandidate);
+        if (msg.key.fromMe && botDigits) {
+            senderDigits = botDigits;
+        }
+
+        const cleanOwners = botConfig.owners.map((n) => normalizePhoneNumber(n));
+        const cleanAllowedUsers = botConfig.allowedUsers.map((n) => normalizePhoneNumber(n));
+
         const isOwner =
             Boolean(msg.key.fromMe) ||
             (senderDigits !== '' && (senderDigits === botDigits || senderDigits === botLidDigits || cleanOwners.includes(senderDigits)));
+
+        const isAllowedUser = isOwner || (senderDigits !== '' && cleanAllowedUsers.includes(senderDigits));
+
+        // Cek apakah chat ini adalah Self-Chat (nomor sendiri / Saved Messages)
+        const remoteDigits = extractDigits(remoteJid);
+        const isSelfChat =
+            !isGroup &&
+            (remoteDigits === botDigits || remoteDigits === botLidDigits || cleanOwners.includes(remoteDigits));
 
         const messageType = Object.keys(msg.message)[0];
         const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -655,14 +644,147 @@ async function startBot() {
         const parts = caption.trim().split(/\s+/);
         const baseCmd = (parts[0] || '').toLowerCase();
 
-        // === PERINTAH SAKLAR MODE (MUTLAK HANYA UNTUK OWNER) ===
+        // === PERINTAH MANAJEMEN PENGGUNA & ADMIN MANUAL (.add, .del, .listuser) ===
+        if (baseCmd === '.add') {
+            if (!isOwner) return;
+
+            const arg1 = (parts[1] || '').toLowerCase();
+            const isAddingAdmin = arg1 === 'admin' || arg1 === 'owner';
+            const rawNumInput = isAddingAdmin ? parts.slice(2).join('') : parts.slice(1).join('');
+
+            // Jika tanpa nomor, cek apakah me-reply pesan seseorang
+            let targetNum = normalizePhoneNumber(rawNumInput);
+            if (!targetNum) {
+                const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
+                if (quotedParticipant) {
+                    targetNum = normalizePhoneNumber(extractDigits(quotedParticipant));
+                }
+            }
+
+            if (!targetNum || targetNum.length < 9) {
+                await sock.sendMessage(
+                    remoteJid,
+                    {
+                        text:
+                            `⚠️ *Format salah!*\n` +
+                            `• Tambah Pengguna: *.add 0812xxx* (atau +62 812-xxx)\n` +
+                            `• Tambah Admin: *.add admin 0812xxx*\n` +
+                            `• _(Bisa juga dengan me-reply pesan orangnya lalu ketik .add)_`
+                    },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            if (isAddingAdmin) {
+                if (!cleanOwners.includes(targetNum)) {
+                    botConfig.owners.push(targetNum);
+                }
+                if (!cleanAllowedUsers.includes(targetNum)) {
+                    botConfig.allowedUsers.push(targetNum);
+                }
+                saveConfig(botConfig);
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `👑 Nomor *+${targetNum}* berhasil ditambahkan sebagai *Admin/Owner* secara permanen.` },
+                    { quoted: msg }
+                );
+            } else {
+                if (cleanAllowedUsers.includes(targetNum)) {
+                    await sock.sendMessage(
+                        remoteJid,
+                        { text: `ℹ️ Nomor *+${targetNum}* sudah terdaftar di daftar pengguna.` },
+                        { quoted: msg }
+                    );
+                    return;
+                }
+                botConfig.allowedUsers.push(targetNum);
+                saveConfig(botConfig);
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `✅ Nomor *+${targetNum}* berhasil ditambahkan ke daftar pengguna permanen.` },
+                    { quoted: msg }
+                );
+            }
+            return;
+        }
+
+        if (baseCmd === '.del' || baseCmd === '.hapus') {
+            if (!isOwner) return;
+            let targetNum = normalizePhoneNumber(parts.slice(1).join(''));
+            if (!targetNum) {
+                const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
+                if (quotedParticipant) {
+                    targetNum = normalizePhoneNumber(extractDigits(quotedParticipant));
+                }
+            }
+
+            if (!targetNum) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Masukkan nomor yang ingin dihapus. Contoh: *.del 0812xxx*' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const beforeOwner = botConfig.owners.length;
+            const beforeUser = botConfig.allowedUsers.length;
+            botConfig.owners = botConfig.owners.filter((n) => normalizePhoneNumber(n) !== targetNum);
+            botConfig.allowedUsers = botConfig.allowedUsers.filter((n) => normalizePhoneNumber(n) !== targetNum);
+
+            if (botConfig.owners.length === beforeOwner && botConfig.allowedUsers.length === beforeUser) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `❌ Nomor *+${targetNum}* tidak ditemukan di daftar Admin maupun Pengguna.` },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            saveConfig(botConfig);
+            await sock.sendMessage(
+                remoteJid,
+                { text: `🗑️ Nomor *+${targetNum}* berhasil dihapus dari daftar Admin & Pengguna.` },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.listuser') {
+            if (!isOwner) return;
+            const adminsText =
+                botConfig.owners.length > 0
+                    ? botConfig.owners.map((n, i) => `${i + 1}. +${normalizePhoneNumber(n)}`).join('\n')
+                    : '_Belum ada admin tambahan_';
+
+            const usersText =
+                botConfig.allowedUsers.length > 0
+                    ? botConfig.allowedUsers.map((n, i) => `${i + 1}. +${normalizePhoneNumber(n)}`).join('\n')
+                    : '_Belum ada pengguna terdaftar_';
+
+            await sock.sendMessage(
+                remoteJid,
+                {
+                    text:
+                        `👥 *DAFTAR AKSES BOT (PERMANEN)*\n` +
+                        `Mode Saat Ini: *${botConfig.adminOnly ? '🔒 Admin Only (Khusus Daftar Ini)' : '🌐 Public'}*\n\n` +
+                        `👑 *Admin / Owner:*\n${adminsText}\n\n` +
+                        `✅ *Pengguna Terdaftar (.add):*\n${usersText}`
+                },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        // === PERINTAH SAKLAR MODE (MUTLAK HANYA UNTUK ADMIN/OWNER) ===
         if (baseCmd === '.adminonly' || baseCmd === '.self') {
             if (!isOwner) return;
             botConfig.adminOnly = true;
             saveConfig(botConfig);
             await sock.sendMessage(
                 remoteJid,
-                { text: '🔒 *Mode Admin Only Aktif*\nHanya kamu (Owner) yang dapat menggunakan perintah bot.' },
+                { text: '🔒 *Mode Admin Only Aktif*\nHanya Admin dan nomor yang terdaftar di *.add* yang dapat memakai bot.' },
                 { quoted: msg }
             );
             return;
@@ -680,7 +802,7 @@ async function startBot() {
             return;
         }
 
-        // === FITUR PESAN TERJADWAL (KHUSUS OWNER) ===
+        // === FITUR PESAN TERJADWAL (KHUSUS ADMIN/OWNER) ===
         if (baseCmd === '.jam') {
             if (!isOwner) return;
             const activeCount = schedules.filter((j) => j.status === 'ACTIVE').length;
@@ -696,7 +818,6 @@ async function startBot() {
             if (!isOwner) return;
             const rawBody = caption.slice(parts[0].length).trim();
 
-            // Jika diketik ".jadwal" saja tanpa isi, kirim templat formulir kosong + keterangan
             if (!rawBody) {
                 await sock.sendMessage(
                     remoteJid,
@@ -718,52 +839,36 @@ async function startBot() {
                 return;
             }
 
-            // Reaksi tunggu ⏳
             await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
-
             const form = parseJadwalInput(rawBody);
 
             if (!form.nomor || !form.waktu || !form.pesan) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(
                     remoteJid,
-                    {
-                        text:
-                            `⚠️ *Formulir belum lengkap!*\n` +
-                            `Pastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\n\n` +
-                            `Ketik *.jadwal* tanpa teks untuk menyalin templat kosong.`
-                    },
+                    { text: `⚠️ *Formulir belum lengkap!*\nPastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\nKetik *.jadwal* tanpa teks untuk templat kosong.` },
                     { quoted: msg }
                 );
                 return;
             }
 
-            // Validasi Waktu
             const targetTs = parseScheduleTime(form.waktu);
             if (!targetTs) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(
                     remoteJid,
-                    {
-                        text:
-                            `❌ *Format Waktu tidak valid atau sudah lewat!*\n` +
-                            `Gunakan salah satu format:\n` +
-                            `• *12:30* (jam WIB hari ini/besok)\n` +
-                            `• *27-11-2026 07:00* (tanggal & jam WIB)\n` +
-                            `• *+15m* / *+2h* (hitung mundur menit/jam)`
-                    },
+                    { text: `❌ *Format Waktu tidak valid atau sudah lewat!*\nGunakan: *12:30*, *27-11-2026 07:00*, atau *+15m* / *+2h*` },
                     { quoted: msg }
                 );
                 return;
             }
 
-            // Validasi Jumlah & Jeda
             const countMatch = form.jumlah.match(/^(\d+)(?::(\d+))?$/);
             if (!countMatch) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(
                     remoteJid,
-                    { text: '❌ *Format Jumlah salah!* Contoh: *1*, *3* (jeda 5 detik), atau *3:60* (3 pesan, jeda 60 detik).' },
+                    { text: '❌ *Format Jumlah salah!* Contoh: *1*, *3* (jeda 5 detik), atau *3:60*.' },
                     { quoted: msg }
                 );
                 return;
@@ -772,27 +877,16 @@ async function startBot() {
             const totalCount = Number(countMatch[1]);
             const intervalSec = countMatch[2] ? Number(countMatch[2]) : 5;
 
-            if (totalCount < 1 || totalCount > 15) {
+            if (totalCount < 1 || totalCount > 15 || intervalSec < 3) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(
                     remoteJid,
-                    { text: '❌ *Jumlah:* harus antara *1 sampai 15 pesan* demi keamanan akun.' },
+                    { text: '❌ Jumlah harus *1–15 pesan* dan jeda minimal *3 detik*.' },
                     { quoted: msg }
                 );
                 return;
             }
 
-            if (intervalSec < 3) {
-                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: '❌ Jeda antar-pesan minimal *3 detik* (contoh: *3:5*) agar aman dari deteksi spam.' },
-                    { quoted: msg }
-                );
-                return;
-            }
-
-            // Validasi & Normalisasi Nomor Tujuan
             let targetJid = '';
             let targetLabel = '';
 
@@ -803,11 +897,7 @@ async function startBot() {
                 const cleanNum = normalizePhoneNumber(form.nomor);
                 if (cleanNum.length < 9) {
                     await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
-                    await sock.sendMessage(
-                        remoteJid,
-                        { text: '❌ *Nomor:* tidak valid. Pastikan panjang nomor benar.' },
-                        { quoted: msg }
-                    );
+                    await sock.sendMessage(remoteJid, { text: '❌ *Nomor:* tidak valid.' }, { quoted: msg });
                     return;
                 }
 
@@ -869,8 +959,6 @@ async function startBot() {
                 },
                 { quoted: msg }
             );
-
-            // Reaksi centang ✅ setelah tersimpan
             await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
             return;
         }
@@ -936,32 +1024,23 @@ async function startBot() {
                     j.logs.push(`${stopTime} - Dihentikan manual (${j.sentCount}/${j.totalCount})`);
                 }
                 saveSchedules(schedules);
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: `🛑 *${activeJobs.length} jadwal aktif* berhasil dihentikan.` },
-                    { quoted: msg }
-                );
+                await sock.sendMessage(remoteJid, { text: `🛑 *${activeJobs.length} jadwal aktif* berhasil dihentikan.` }, { quoted: msg });
                 return;
             }
 
             const targetId = Number(arg);
             const job = schedules.find((j) => j.id === targetId && j.status === 'ACTIVE');
             if (!job) {
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: `❌ Jadwal aktif *#${arg}* tidak ditemukan. Cek ID di *.listjadwal*.` },
-                    { quoted: msg }
-                );
+                await sock.sendMessage(remoteJid, { text: `❌ Jadwal aktif *#${arg}* tidak ditemukan.` }, { quoted: msg });
                 return;
             }
 
             job.status = 'STOPPED';
             job.logs.push(`${formatWib()} - Dihentikan manual (${job.sentCount}/${job.totalCount})`);
             saveSchedules(schedules);
-
             await sock.sendMessage(
                 remoteJid,
-                { text: `🛑 *Jadwal #${job.id}* (${job.targetLabel}) berhasil dihentikan pada progres *${job.sentCount}/${job.totalCount}*.` },
+                { text: `🛑 *Jadwal #${job.id}* (${job.targetLabel}) dihentikan pada progres *${job.sentCount}/${job.totalCount}*.` },
                 { quoted: msg }
             );
             return;
@@ -983,7 +1062,7 @@ async function startBot() {
 
             await sock.sendMessage(
                 remoteJid,
-                { text: `📜 *Riwayat 10 Jadwal Terakhir*\n\n${lines.join('\n\n')}\n\n_Ketik .hapusriwayat untuk membersihkan riwayat._` },
+                { text: `📜 *Riwayat 10 Jadwal Terakhir*\n\n${lines.join('\n\n')}\n\n_Ketik .hapusriwayat untuk membersihkan._` },
                 { quoted: msg }
             );
             return;
@@ -995,19 +1074,14 @@ async function startBot() {
             schedules = schedules.filter((j) => j.status === 'ACTIVE');
             saveSchedules(schedules);
             const deleted = before - schedules.length;
-            await sock.sendMessage(
-                remoteJid,
-                { text: `🗑️ *${deleted} riwayat jadwal* berhasil dibersihkan.` },
-                { quoted: msg }
-            );
+            await sock.sendMessage(remoteJid, { text: `🗑️ *${deleted} riwayat jadwal* dibersihkan.` }, { quoted: msg });
             return;
         }
 
-        // Jangan proses stiker ulang saat event edit pesan
         if (isEdited) return;
 
-        // === GERBANG FILTER AKSES: Abaikan total jika Admin Only aktif & pengirim bukan Owner ===
-        if (botConfig.adminOnly && !isOwner) {
+        // === GERBANG FILTER AKSES: Jika Admin Only aktif, hanya Admin & nomor di .add yang bisa akses ===
+        if (botConfig.adminOnly && !isAllowedUser) {
             return;
         }
 
@@ -1015,29 +1089,38 @@ async function startBot() {
         const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
         const cropMode = validModes.includes(cropArg) ? cropArg : 'auto';
 
+        // === MENU DINAMIS: Fitur Admin HANYA muncul jika Admin mengetik .menu di nomor sendiri ===
         if (baseCmd === '.menu') {
-            const statusText = botConfig.adminOnly ? '🔒 Admin Only' : '🌐 Public';
-            await sock.sendMessage(
-                remoteJid,
-                {
-                    text:
-                        `*BOT SOUND STICKER & SCHEDULER*\n` +
-                        `Akses: *${statusText}*\n\n` +
-                        `*1. Stiker & Sound Sticker*\n` +
-                        `• *.s* / *.sa* → Stiker foto/video (auto transparan)\n` +
-                        `• *.s tengah* / *.sa tengah* → Potong 1:1 (tengah/atas/bawah/kiri/kanan)\n\n` +
-                        `*2. Pesan Terjadwal (Owner)*\n` +
-                        `• *.jadwal* 0812xxx, 12:30, 1, pesan\n` +
-                        `  _(Atau ketik .jadwal saja lalu Edit pesanmu)_\n` +
-                        `• *.listjadwal* → Cek antrean & hitung mundur\n` +
-                        `• *.stopjadwal* id / all → Hentikan jadwal\n` +
-                        `• *.riwayatjadwal* → Catatan terkirim & berhenti\n` +
-                        `• *.jam* → Cek waktu realtime WIB bot\n\n` +
-                        `*3. Kontrol Akses (Owner)*\n` +
-                        `• *.adminonly* / *.public* → Kunci atau buka akses bot`
-                },
-                { quoted: msg }
-            );
+            let menuText =
+                `*BOT SOUND STICKER*\n\n` +
+                `*Perintah Stiker:*\n` +
+                `• *.s* → Ubah foto/video/stiker jadi stiker (auto transparan)\n` +
+                `• *.sa* → Ubah video jadi Sound Sticker bersuara\n` +
+                `• *.s tengah* / *.sa tengah* → Potong 1:1 penuh\n` +
+                `  _(Opsi arah: tengah, atas, bawah, kiri, kanan)_`;
+
+            if (isOwner && isSelfChat) {
+                const statusText = botConfig.adminOnly ? '🔒 Admin Only' : '🌐 Public';
+                menuText +=
+                    `\n\n━━━━━━━━━━━━━━━━━━\n` +
+                    `👑 *MENU KHUSUS ADMIN* (${statusText})\n\n` +
+                    `*1. Manajemen Pengguna (.add):*\n` +
+                    `• *.add* 0812xxx → Tambah pengguna permanen\n` +
+                    `• *.add admin* 0812xxx → Tambah admin permanen\n` +
+                    `• *.del* 0812xxx → Hapus pengguna/admin\n` +
+                    `• *.listuser* → Lihat daftar admin & pengguna\n\n` +
+                    `*2. Pesan Terjadwal:*\n` +
+                    `• *.jadwal* 0812xxx, 12:30, 1, pesan\n` +
+                    `  _(Atau ketik .jadwal saja lalu Edit pesanmu)_\n` +
+                    `• *.listjadwal* → Cek antrean & hitung mundur\n` +
+                    `• *.stopjadwal* id / all → Hentikan jadwal\n` +
+                    `• *.riwayatjadwal* → Catatan terkirim & berhenti\n` +
+                    `• *.jam* → Cek waktu realtime WIB bot\n\n` +
+                    `*3. Kontrol Akses Bot:*\n` +
+                    `• *.adminonly* / *.public* → Kunci atau buka akses bot`;
+            }
+
+            await sock.sendMessage(remoteJid, { text: menuText }, { quoted: msg });
             return;
         }
 
@@ -1054,7 +1137,7 @@ async function startBot() {
             quotedType === 'videoMessage' ||
             Boolean(msg.message.stickerMessage?.isAnimated || quotedMsg?.stickerMessage?.isAnimated);
 
-        // Perintah .s (Stiker Biasa Foto/Video + Dukungan Reply Stiker + Mode Potong 1:1 + Reaksi ⏳ / ✅ / ❌)
+        // Perintah .s
         if (baseCmd === '.s') {
             if (!targetMedia) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
@@ -1090,7 +1173,7 @@ async function startBot() {
             }
         }
 
-        // Perintah .sa (Sound Sticker + Dukungan Mode Potong 1:1 & Transparansi + Reaksi ⏳ / ✅ / ❌)
+        // Perintah .sa
         if (baseCmd === '.sa') {
             if (!targetMedia || !isVideo || isSticker) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
@@ -1160,13 +1243,11 @@ async function startBot() {
         }
     }
 
-    // Dengarkan pesan baru
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
         await handleIncomingMessage(messages[0], false);
     });
 
-    // Dengarkan pesan yang diedit oleh pengguna (Edited Message)
     sock.ev.on('messages.update', async (updates) => {
         for (const { key, update } of updates) {
             const editedContent =
