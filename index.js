@@ -19,6 +19,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
+const SCHEDULES_PATH = path.join(__dirname, 'schedules.json');
 const SESSION_PATH = path.join(__dirname, 'auth_session');
 
 // === PATCH PROTOBUF STATIC ENCODER: Suntikkan Field 26 (audioMessage) ke StickerMessage ===
@@ -80,6 +81,176 @@ function saveConfig(cfg) {
 }
 
 let botConfig = loadConfig();
+
+// === MANAJEMEN SCHEDULES.JSON (PESAN TERJADWAL) ===
+function loadSchedules() {
+    try {
+        if (!fs.existsSync(SCHEDULES_PATH)) {
+            fs.writeFileSync(SCHEDULES_PATH, JSON.stringify([], null, 2));
+            return [];
+        }
+        const data = JSON.parse(fs.readFileSync(SCHEDULES_PATH, 'utf8'));
+        return Array.isArray(data) ? data : [];
+    } catch (err) {
+        return [];
+    }
+}
+
+function saveSchedules(list) {
+    fs.writeFileSync(SCHEDULES_PATH, JSON.stringify(list, null, 2));
+}
+
+let schedules = loadSchedules();
+let activeSock = null;
+let isSchedulerTickRunning = false;
+
+// === FUNGSI WAKTU REALTIME WIB (Asia/Jakarta, UTC+7) ===
+function getWibParts(timestamp = Date.now()) {
+    const dtf = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Jakarta',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    });
+    const parts = dtf.formatToParts(new Date(timestamp));
+    const map = {};
+    for (const p of parts) {
+        if (p.type !== 'literal') map[p.type] = p.value;
+    }
+    return map;
+}
+
+function formatWib(timestamp = Date.now()) {
+    const p = getWibParts(timestamp);
+    return `${p.day}-${p.month}-${p.year} ${p.hour}:${p.minute}:${p.second} WIB`;
+}
+
+function formatCountdown(ms) {
+    if (ms <= 0) return 'Segera diproses...';
+    const totalSec = Math.floor(ms / 1000);
+    const days = Math.floor(totalSec / 86400);
+    const hours = Math.floor((totalSec % 86400) / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    const secs = totalSec % 60;
+    const chunks = [];
+    if (days > 0) chunks.push(`${days} hari`);
+    if (hours > 0) chunks.push(`${hours} jam`);
+    if (mins > 0) chunks.push(`${mins} menit`);
+    if (secs > 0 || chunks.length === 0) chunks.push(`${secs} detik`);
+    return chunks.join(' ');
+}
+
+function parseScheduleTime(input) {
+    const clean = input.trim().toLowerCase();
+    const now = Date.now();
+
+    // Mode 1: Hitung mundur relatif (+15m, +2h, +30s)
+    const relMatch = clean.match(/^\+(\d+)([smh])$/);
+    if (relMatch) {
+        const val = Number(relMatch[1]);
+        const unit = relMatch[2];
+        if (val <= 0) return null;
+        const mult = unit === 's' ? 1000 : unit === 'm' ? 60000 : 3600000;
+        return now + val * mult;
+    }
+
+    // Mode 2: Jam hari ini (HH:mm)
+    const timeOnlyMatch = clean.match(/^(\d{1,2}):(\d{2})$/);
+    if (timeOnlyMatch) {
+        const hh = Number(timeOnlyMatch[1]);
+        const mm = Number(timeOnlyMatch[2]);
+        if (hh > 23 || mm > 59) return null;
+
+        const p = getWibParts(now);
+        const isoStr = `${p.year}-${p.month}-${p.day}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00+07:00`;
+        let targetTs = Date.parse(isoStr);
+        if (targetTs <= now) {
+            targetTs += 24 * 60 * 60 * 1000; // Otomatis besok jika jam hari ini sudah lewat
+        }
+        return targetTs;
+    }
+
+    // Mode 3: Tanggal & Jam spesifik (DD-MM-YYYY HH:mm)
+    const fullMatch = clean.match(/^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2}):(\d{2})$/);
+    if (fullMatch) {
+        const dd = String(fullMatch[1]).padStart(2, '0');
+        const mo = String(fullMatch[2]).padStart(2, '0');
+        const yyyy = fullMatch[3];
+        const hh = String(fullMatch[4]).padStart(2, '0');
+        const mm = String(fullMatch[5]).padStart(2, '0');
+        if (Number(hh) > 23 || Number(mm) > 59 || Number(mo) > 12 || Number(dd) > 31) return null;
+
+        const isoStr = `${yyyy}-${mo}-${dd}T${hh}:${mm}:00+07:00`;
+        const targetTs = Date.parse(isoStr);
+        if (Number.isNaN(targetTs) || targetTs <= now) return null;
+        return targetTs;
+    }
+
+    return null;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Mesin pengecek jadwal realtime setiap 1 detik
+setInterval(async () => {
+    if (!activeSock || isSchedulerTickRunning) return;
+    const now = Date.now();
+    const dueJobs = schedules.filter((j) => j.status === 'ACTIVE' && j.nextRunAt <= now);
+    if (dueJobs.length === 0) return;
+
+    isSchedulerTickRunning = true;
+    try {
+        for (const job of dueJobs) {
+            if (job.status !== 'ACTIVE') continue;
+
+            try {
+                await activeSock.sendPresenceUpdate('composing', job.targetJid);
+                await sleep(1200);
+                await activeSock.sendMessage(job.targetJid, { text: job.message });
+                await activeSock.sendPresenceUpdate('paused', job.targetJid);
+
+                job.sentCount += 1;
+                const sentTime = formatWib(Date.now());
+                job.logs.push(`${sentTime} - Terkirim (${job.sentCount}/${job.totalCount})`);
+
+                if (job.sentCount >= job.totalCount) {
+                    job.status = 'COMPLETED';
+                    job.completedAt = sentTime;
+                    saveSchedules(schedules);
+
+                    if (job.notifyJid) {
+                        await activeSock.sendMessage(job.notifyJid, {
+                            text:
+                                `✅ *Jadwal #${job.id} Selesai*\n` +
+                                `Tujuan: ${job.targetLabel}\n` +
+                                `Terkirim: *${job.sentCount}/${job.totalCount} pesan*\n` +
+                                `Selesai pada: ${sentTime}`
+                        });
+                    }
+                } else {
+                    job.nextRunAt = Date.now() + job.intervalSec * 1000;
+                    saveSchedules(schedules);
+                }
+            } catch (err) {
+                job.status = 'FAILED';
+                job.logs.push(`${formatWib(Date.now())} - Gagal: ${err.message}`);
+                saveSchedules(schedules);
+
+                if (job.notifyJid) {
+                    await activeSock.sendMessage(job.notifyJid, {
+                        text: `❌ *Jadwal #${job.id} Gagal*\nTujuan: ${job.targetLabel}\nAlasan: ${err.message}`
+                    });
+                }
+            }
+        }
+    } finally {
+        isSchedulerTickRunning = false;
+    }
+}, 1000);
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
@@ -147,15 +318,12 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
     exifChunkHeader.writeUInt32LE(exifPayload.length, 4);
     const exifPad = exifPayload.length % 2 === 1 ? Buffer.from([0x00]) : Buffer.alloc(0);
 
-    // Pastikan jika WebP masih memakai chunk VP8/VP8L biasa tanpa VP8X, tambahkan header VP8X agar EXIF terbaca WhatsApp
     const chunkFourCC = webpBuffer.toString('ascii', 12, 16);
     if (chunkFourCC === 'VP8 ' || chunkFourCC === 'VP8L') {
         const vp8xHeader = Buffer.alloc(18);
         vp8xHeader.write('VP8X', 0, 4, 'ascii');
         vp8xHeader.writeUInt32LE(10, 4);
-        // Flag EXIF (0x08) + Alpha (0x10 jika VP8L)
         vp8xHeader.writeUInt8(chunkFourCC === 'VP8L' ? 0x18 : 0x08, 8);
-        // Canvas width - 1 (511 = 0x0001FF) dan height - 1 (511 = 0x0001FF)
         vp8xHeader.writeUIntLE(511, 12, 3);
         vp8xHeader.writeUIntLE(511, 15, 3);
 
@@ -174,7 +342,6 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
         return combined;
     }
 
-    // Jika sudah VP8X, aktifkan bit flag EXIF (0x08) di byte ke-20
     const updatedWebp = Buffer.from(webpBuffer);
     if (chunkFourCC === 'VP8X') {
         updatedWebp[20] = updatedWebp[20] | 0x08;
@@ -364,12 +531,14 @@ async function startBot() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'open') {
+            activeSock = sock;
             isPairingActive = false;
             if (pairingTimeout) clearInterval(pairingTimeout);
             try { rl.close(); } catch (e) {}
-            console.log(`\n[SUKSES] Bot WhatsApp aktif! Mode saat ini: ${botConfig.adminOnly ? 'ADMIN ONLY (Khusus Owner)' : 'PUBLIC'}`);
+            console.log(`\n[SUKSES] Bot WhatsApp aktif! Mode: ${botConfig.adminOnly ? 'ADMIN ONLY' : 'PUBLIC'} | Waktu: ${formatWib()}`);
         }
         if (connection === 'close') {
+            activeSock = null;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             if (isPairingActive && statusCode !== DisconnectReason.restartRequired) return;
@@ -408,8 +577,8 @@ async function startBot() {
             msg.message.videoMessage?.caption ||
             '';
 
-        const parts = caption.trim().toLowerCase().split(/\s+/);
-        const baseCmd = parts[0] || '';
+        const parts = caption.trim().split(/\s+/);
+        const baseCmd = (parts[0] || '').toLowerCase();
 
         // === PERINTAH SAKLAR MODE (MUTLAK HANYA UNTUK OWNER) ===
         if (baseCmd === '.adminonly' || baseCmd === '.self') {
@@ -418,7 +587,7 @@ async function startBot() {
             saveConfig(botConfig);
             await sock.sendMessage(
                 remoteJid,
-                { text: '🔒 *Mode Admin Only Aktif*\nSekarang hanya kamu (Owner) yang dapat menggunakan perintah bot di grup maupun chat pribadi.' },
+                { text: '🔒 *Mode Admin Only Aktif*\nHanya kamu (Owner) yang dapat menggunakan perintah bot.' },
                 { quoted: msg }
             );
             return;
@@ -430,7 +599,299 @@ async function startBot() {
             saveConfig(botConfig);
             await sock.sendMessage(
                 remoteJid,
-                { text: '🌐 *Mode Public Aktif*\nSekarang semua member dapat menggunakan perintah stiker bot.' },
+                { text: '🌐 *Mode Public Aktif*\nSemua member sekarang dapat menggunakan perintah stiker bot.' },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        // === FITUR PESAN TERJADWAL (KHUSUS OWNER) ===
+        if (baseCmd === '.jam') {
+            if (!isOwner) return;
+            const activeCount = schedules.filter((j) => j.status === 'ACTIVE').length;
+            await sock.sendMessage(
+                remoteJid,
+                { text: `🕒 *Waktu Realtime Bot:*\n${formatWib()}\nAntrean jadwal aktif: *${activeCount}*` },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.jadwal') {
+            if (!isOwner) return;
+            const rawArgs = caption.slice(parts[0].length).trim();
+            const segs = rawArgs.split('|').map((s) => s.trim());
+
+            if (segs.length < 4 || !segs[0] || !segs[1] || !segs[2] || !segs[3]) {
+                await sock.sendMessage(
+                    remoteJid,
+                    {
+                        text:
+                            `⚠️ *Format salah!*\n` +
+                            `Gunakan: *.jadwal nomor | waktu | jumlah | pesan*\n\n` +
+                            `Contoh:\n` +
+                            `• *.jadwal 6281234567890 | 20:30 | 1 | Halo!*\n` +
+                            `• *.jadwal 6281234567890 | +15m | 3:10 | Rapat mulai!*\n` +
+                            `• *.jadwal sini | 27-11-2026 07:00 | 1 | Pagi semua!*`
+                    },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const [targetInput, timeInput, countInput, ...msgRest] = segs;
+            const messageText = msgRest.join(' | ');
+
+            // Validasi Waktu
+            const targetTs = parseScheduleTime(timeInput);
+            if (!targetTs) {
+                await sock.sendMessage(
+                    remoteJid,
+                    {
+                        text:
+                            `❌ *Format waktu tidak valid atau sudah terlewat!*\n` +
+                            `Gunakan salah satu format berikut:\n` +
+                            `• *20:30* (jam WIB hari ini/besok)\n` +
+                            `• *27-11-2026 07:00* (tanggal & jam WIB)\n` +
+                            `• *+15m* / *+2h* (hitung mundur menit/jam)`
+                    },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            // Validasi Jumlah & Jeda (contoh: "3" -> 3 pesan jeda 5d, atau "3:60" -> 3 pesan jeda 60d)
+            const countMatch = countInput.match(/^(\d+)(?::(\d+))?$/);
+            if (!countMatch) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '❌ *Format jumlah salah!* Contoh: *1*, *3* (jeda 5 detik), atau *3:60* (3 pesan, jeda 60 detik).' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const totalCount = Number(countMatch[1]);
+            const intervalSec = countMatch[2] ? Number(countMatch[2]) : 5;
+
+            if (totalCount < 1 || totalCount > 15) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '❌ Jumlah pesan per jadwal harus antara *1 sampai 15 pesan* demi keamanan akun.' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            if (intervalSec < 3) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '❌ Jeda antar-pesan minimal *3 detik* (contoh: *3:5*) agar tidak terdeteksi spam.' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            // Validasi Nomor Tujuan
+            let targetJid = '';
+            let targetLabel = '';
+
+            if (targetInput.toLowerCase() === 'sini' || targetInput.toLowerCase() === 'here') {
+                targetJid = remoteJid;
+                targetLabel = isGroup ? 'Grup Ini' : 'Chat Ini';
+            } else {
+                let cleanNum = targetInput.replace(/[^0-9]/g, '');
+                if (cleanNum.startsWith('08')) {
+                    cleanNum = '62' + cleanNum.slice(1);
+                }
+                if (cleanNum.length < 9) {
+                    await sock.sendMessage(remoteJid, { text: '❌ Nomor tujuan tidak valid. Gunakan awalan 62 atau 08.' }, { quoted: msg });
+                    return;
+                }
+
+                try {
+                    const [waCheck] = await sock.onWhatsApp(cleanNum);
+                    if (!waCheck || !waCheck.exists) {
+                        await sock.sendMessage(
+                            remoteJid,
+                            { text: `❌ Nomor *${cleanNum}* tidak terdaftar di WhatsApp.` },
+                            { quoted: msg }
+                        );
+                        return;
+                    }
+                    targetJid = waCheck.jid;
+                    targetLabel = cleanNum;
+                } catch (err) {
+                    targetJid = `${cleanNum}@s.whatsapp.net`;
+                    targetLabel = cleanNum;
+                }
+            }
+
+            const nextId = schedules.length > 0 ? Math.max(...schedules.map((s) => s.id)) + 1 : 1;
+            const ownerNotifyJid = botDigits ? `${botDigits}@s.whatsapp.net` : remoteJid;
+            const scheduledText = formatWib(targetTs);
+
+            const newJob = {
+                id: nextId,
+                targetJid,
+                targetLabel,
+                notifyJid: ownerNotifyJid,
+                message: messageText,
+                createdAt: formatWib(Date.now()),
+                scheduledAt: targetTs,
+                nextRunAt: targetTs,
+                scheduledText,
+                totalCount,
+                sentCount: 0,
+                intervalSec,
+                status: 'ACTIVE',
+                logs: []
+            };
+
+            schedules.push(newJob);
+            saveSchedules(schedules);
+
+            const sisaWaktu = formatCountdown(targetTs - Date.now());
+            await sock.sendMessage(
+                remoteJid,
+                {
+                    text:
+                        `📅 *Jadwal #${newJob.id} Tersimpan!*\n` +
+                        `• Tujuan: *${targetLabel}*\n` +
+                        `• Waktu Kirim: *${scheduledText}*\n` +
+                        `• Hitung Mundur: *${sisaWaktu}*\n` +
+                        `• Jumlah: *${totalCount} pesan* (jeda ${intervalSec} detik)\n` +
+                        `• Isi: _"${messageText}"_\n\n` +
+                        `Ketik *.listjadwal* untuk cek hitung mundur atau *.stopjadwal ${newJob.id}* untuk batal.`
+                },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.listjadwal') {
+            if (!isOwner) return;
+            const activeJobs = schedules.filter((j) => j.status === 'ACTIVE');
+            if (activeJobs.length === 0) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `📭 Tidak ada jadwal aktif saat ini.\nWaktu sekarang: *${formatWib()}*` },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const now = Date.now();
+            const lines = activeJobs.map((j) => {
+                const remain = formatCountdown(j.nextRunAt - now);
+                return (
+                    `*#${j.id}* → *${j.targetLabel}*\n` +
+                    `   Waktu: ${j.scheduledText}\n` +
+                    `   Sisa Waktu: *${remain}*\n` +
+                    `   Progres: ${j.sentCount}/${j.totalCount} pesan (jeda ${j.intervalSec}d)`
+                );
+            });
+
+            await sock.sendMessage(
+                remoteJid,
+                {
+                    text:
+                        `⏳ *Antrean Jadwal Aktif (${activeJobs.length})*\n` +
+                        `Realtime: ${formatWib(now)}\n\n` +
+                        lines.join('\n\n') +
+                        `\n\n_Ketik .stopjadwal <id> untuk menghentikan._`
+                },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.stopjadwal') {
+            if (!isOwner) return;
+            const arg = (parts[1] || '').replace('#', '').toLowerCase();
+            if (!arg) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Masukkan ID jadwal atau *all*.\nContoh: *.stopjadwal 1* atau *.stopjadwal all*' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            if (arg === 'all') {
+                const activeJobs = schedules.filter((j) => j.status === 'ACTIVE');
+                if (activeJobs.length === 0) {
+                    await sock.sendMessage(remoteJid, { text: '📭 Tidak ada jadwal aktif untuk dihentikan.' }, { quoted: msg });
+                    return;
+                }
+                const stopTime = formatWib();
+                for (const j of activeJobs) {
+                    j.status = 'STOPPED';
+                    j.logs.push(`${stopTime} - Dihentikan manual (${j.sentCount}/${j.totalCount})`);
+                }
+                saveSchedules(schedules);
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `🛑 *${activeJobs.length} jadwal aktif* berhasil dihentikan.` },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const targetId = Number(arg);
+            const job = schedules.find((j) => j.id === targetId && j.status === 'ACTIVE');
+            if (!job) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: `❌ Jadwal aktif *#${arg}* tidak ditemukan. Cek ID di *.listjadwal*.` },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            job.status = 'STOPPED';
+            job.logs.push(`${formatWib()} - Dihentikan manual (${job.sentCount}/${job.totalCount})`);
+            saveSchedules(schedules);
+
+            await sock.sendMessage(
+                remoteJid,
+                { text: `🛑 *Jadwal #${job.id}* (${job.targetLabel}) berhasil dihentikan pada progres *${job.sentCount}/${job.totalCount}*.` },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.riwayatjadwal') {
+            if (!isOwner) return;
+            const pastJobs = schedules.filter((j) => j.status !== 'ACTIVE').slice(-10).reverse();
+            if (pastJobs.length === 0) {
+                await sock.sendMessage(remoteJid, { text: '📭 Belum ada riwayat pesan terjadwal.' }, { quoted: msg });
+                return;
+            }
+
+            const lines = pastJobs.map((j) => {
+                const icon = j.status === 'COMPLETED' ? '✅' : j.status === 'STOPPED' ? '🛑' : '❌';
+                const lastLog = j.logs[j.logs.length - 1] || j.scheduledText;
+                return `${icon} *#${j.id}* → ${j.targetLabel} (${j.sentCount}/${j.totalCount})\n   ${lastLog}`;
+            });
+
+            await sock.sendMessage(
+                remoteJid,
+                { text: `📜 *Riwayat 10 Jadwal Terakhir*\n\n${lines.join('\n\n')}\n\n_Ketik .hapusriwayat untuk membersihkan riwayat._` },
+                { quoted: msg }
+            );
+            return;
+        }
+
+        if (baseCmd === '.hapusriwayat') {
+            if (!isOwner) return;
+            const before = schedules.length;
+            schedules = schedules.filter((j) => j.status === 'ACTIVE');
+            saveSchedules(schedules);
+            const deleted = before - schedules.length;
+            await sock.sendMessage(
+                remoteJid,
+                { text: `🗑️ *${deleted} riwayat jadwal* berhasil dibersihkan.` },
                 { quoted: msg }
             );
             return;
@@ -441,27 +902,31 @@ async function startBot() {
             return;
         }
 
+        const cropArg = (parts[1] || '').toLowerCase();
         const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
-        const cropMode = validModes.includes(parts[1]) ? parts[1] : 'auto';
+        const cropMode = validModes.includes(cropArg) ? cropArg : 'auto';
 
         if (baseCmd === '.menu') {
-            const statusText = botConfig.adminOnly ? '🔒 Admin Only (Khusus Owner)' : '🌐 Public (Semua Member)';
+            const statusText = botConfig.adminOnly ? '🔒 Admin Only' : '🌐 Public';
             await sock.sendMessage(
                 remoteJid,
                 {
                     text:
-                        `*Menu Bot Sound Sticker*\n` +
-                        `Status Akses: *${statusText}*\n\n` +
-                        `1. *.s* → Stiker Biasa (Foto/Video, Auto Transparan)\n` +
-                        `2. *.sa* → Sound Sticker (Video, hingga 30 detik)\n\n` +
-                        `*Mode Potong 1:1 (Fullscreen):*\n` +
-                        `• *.sa tengah* / *.s tengah* → Potong 1:1 tengah\n` +
-                        `• *.sa atas* / *.s atas* → Potong 1:1 atas\n` +
-                        `• *.sa bawah* / *.s bawah* → Potong 1:1 bawah\n` +
-                        `• *.sa kiri* / *.sa kanan* → Potong 1:1 kiri/kanan\n\n` +
-                        `*Kontrol Owner:*\n` +
-                        `• *.adminonly* → Kunci bot hanya untuk kamu\n` +
-                        `• *.public* → Izinkan semua orang memakai bot`
+                        `*BOT SOUND STICKER & SCHEDULER*\n` +
+                        `Akses: *${statusText}*\n\n` +
+                        `*1. Stiker & Sound Sticker*\n` +
+                        `• *.s* / *.sa* → Stiker foto/video (auto transparan)\n` +
+                        `• *.s tengah* / *.sa tengah* → Potong 1:1 (tengah/atas/bawah/kiri/kanan)\n\n` +
+                        `*2. Pesan Terjadwal (Owner)*\n` +
+                        `• *.jadwal* nomor | waktu | jumlah | pesan\n` +
+                        `  _Waktu: 20:30 / 27-11-2026 07:00 / +15m_\n` +
+                        `  _Jumlah: 3 (jeda 5d) atau 3:60 (jeda 60d)_\n` +
+                        `• *.listjadwal* → Cek antrean & hitung mundur\n` +
+                        `• *.stopjadwal* id / all → Hentikan jadwal\n` +
+                        `• *.riwayatjadwal* → Catatan terkirim & berhenti\n` +
+                        `• *.jam* → Cek waktu realtime WIB bot\n\n` +
+                        `*3. Kontrol Akses (Owner)*\n` +
+                        `• *.adminonly* / *.public* → Kunci atau buka akses bot`
                 },
                 { quoted: msg }
             );

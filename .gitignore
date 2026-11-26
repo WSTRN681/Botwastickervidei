@@ -7,3 +7,4 @@ auth_session/
 *.jpg
 .env
 config.json
+schedules.json
