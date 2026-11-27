@@ -12,31 +12,15 @@ import makeWASocket, {
 import pino from 'pino';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import http from 'http';
 import readline from 'readline';
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, 'config.json');
 const SCHEDULES_PATH = path.join(__dirname, 'schedules.json');
-const CHATS_HISTORY_PATH = path.join(__dirname, 'chats_history.json');
-const PANEL_HTML_PATH = path.join(__dirname, 'panel.html');
 const SESSION_PATH = path.join(__dirname, 'auth_session');
-let activePanelPort = 8080;
-
-const sseClients = new Set();
-function broadcastSSE(payload) {
-    const msg = `data: ${JSON.stringify(payload)}\n\n`;
-    for (const res of sseClients) {
-        try {
-            res.write(msg);
-        } catch (e) {
-            sseClients.delete(res);
-        }
-    }
-}
 
 // === PATCH PROTOBUF STATIC ENCODER ===
 try {
@@ -65,87 +49,10 @@ try {
         };
 
         StickerMsg._audioPatched = true;
-        console.log('[INFO] Binary Encoder StickerMessage.audioMessage (Field 26) berhasil di-patch!');
+        console.log('[INFO] Protobuf StickerMessage.audioMessage patched');
     }
 } catch (e) {
     console.log('[WARN] Gagal patch Protobuf:', e.message);
-}
-
-// === MANAJEMEN CONFIG.JSON (ADMIN, ALLOWED USERS, MODE) ===
-function loadConfig() {
-    const defaultConfig = {
-        adminOnly: true,
-        owners: [],
-        allowedUsers: []
-    };
-    try {
-        if (!fs.existsSync(CONFIG_PATH)) {
-            fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
-            return defaultConfig;
-        }
-        const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-        return {
-            adminOnly: typeof parsed.adminOnly === 'boolean' ? parsed.adminOnly : true,
-            owners: Array.isArray(parsed.owners) ? parsed.owners : [],
-            allowedUsers: Array.isArray(parsed.allowedUsers) ? parsed.allowedUsers : []
-        };
-    } catch (err) {
-        return defaultConfig;
-    }
-}
-
-function saveConfig(cfg) {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-    broadcastSSE({ type: 'user' });
-}
-
-let botConfig = loadConfig();
-
-// === MANAJEMEN RIWAYAT PERCAKAPAN (chats_history.json) ===
-function loadChatsHistory() {
-    try {
-        if (!fs.existsSync(CHATS_HISTORY_PATH)) {
-            fs.writeFileSync(CHATS_HISTORY_PATH, JSON.stringify([], null, 2));
-            return [];
-        }
-        const parsed = JSON.parse(fs.readFileSync(CHATS_HISTORY_PATH, 'utf8'));
-        return Array.isArray(parsed) ? parsed : [];
-    } catch (err) {
-        return [];
-    }
-}
-
-function saveChatsHistory(list) {
-    fs.writeFileSync(CHATS_HISTORY_PATH, JSON.stringify(list, null, 2));
-}
-
-let chatLogs = loadChatsHistory();
-
-function recordChat(number, pushName, contextLabel, incomingText, botReplyText) {
-    if (!number) return null;
-    const entry = {
-        id: Date.now() + Math.random(),
-        number,
-        name: pushName || 'Pengguna WA',
-        context: contextLabel,
-        time: formatWib(),
-        incoming: incomingText || '[Media]',
-        reply: botReplyText
-    };
-    chatLogs.push(entry);
-    if (chatLogs.length > 500) {
-        chatLogs = chatLogs.slice(-500);
-    }
-    saveChatsHistory(chatLogs);
-    broadcastSSE({ type: 'chat' });
-    return entry;
-}
-
-function updateChatReply(entry, newReply) {
-    if (!entry) return;
-    entry.reply = newReply;
-    saveChatsHistory(chatLogs);
-    broadcastSSE({ type: 'chat' });
 }
 
 // === MANAJEMEN SCHEDULES.JSON ===
@@ -366,139 +273,75 @@ setInterval(async () => {
     }
 }, 1000);
 
-// === WEB SERVER PANEL LOKAL DENGAN AUTO-PORT ===
-const panelServer = http.createServer((req, res) => {
-    const url = req.url.split('?')[0];
-
-    if (req.method === 'GET' && url === '/') {
-        if (fs.existsSync(PANEL_HTML_PATH)) {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(fs.readFileSync(PANEL_HTML_PATH, 'utf8'));
-        } else {
-            res.writeHead(404, { 'Content-Type': 'text/plain' });
-            res.end('File panel.html tidak ditemukan.');
-        }
-        return;
-    }
-
-    if (req.method === 'GET' && url === '/api/stream') {
-        res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive'
-        });
-        sseClients.add(res);
-        req.on('close', () => sseClients.delete(res));
-        return;
-    }
-
-    if (req.method === 'GET' && url === '/api/state') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-            JSON.stringify({
-                connected: Boolean(activeSock),
-                adminOnly: botConfig.adminOnly,
-                wibTime: formatWib(),
-                activeSchedules: schedules.filter((j) => j.status === 'ACTIVE').length,
-                owners: botConfig.owners.map((n) => normalizePhoneNumber(n)),
-                allowedUsers: botConfig.allowedUsers.map((n) => normalizePhoneNumber(n)),
-                chats: chatLogs
-            })
-        );
-        return;
-    }
-
-    if (req.method === 'GET' && url === '/api/code') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ code: fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8') }));
-        return;
-    }
-
-    if (req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', () => {
-            try {
-                const payload = body ? JSON.parse(body) : {};
-
-                if (url === '/api/toggle-mode') {
-                    botConfig.adminOnly = !botConfig.adminOnly;
-                    saveConfig(botConfig);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, adminOnly: botConfig.adminOnly }));
-                    return;
-                }
-
-                if (url === '/api/clear-chats') {
-                    chatLogs = [];
-                    saveChatsHistory(chatLogs);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true }));
-                    return;
-                }
-
-                if (url === '/api/code' && payload.code) {
-                    fs.writeFileSync(path.join(__dirname, 'index.js'), payload.code, 'utf8');
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true }));
-                    return;
-                }
-
-                if (url === '/api/restart') {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true }));
-                    panelServer.close();
-                    setTimeout(() => {
-                        spawn(process.argv[0], process.argv.slice(1), {
-                            cwd: __dirname,
-                            detached: true,
-                            stdio: 'inherit'
-                        }).unref();
-                        process.exit(0);
-                    }, 500);
-                    return;
-                }
-
-                if (url === '/api/stop') {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true }));
-                    setTimeout(() => process.exit(0), 400);
-                    return;
-                }
-            } catch (err) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: err.message }));
-                return;
-            }
-            res.writeHead(404);
-            res.end();
-        });
-        return;
-    }
-
-    res.writeHead(404);
-    res.end();
-});
-
-function startPanelServer(port) {
-    activePanelPort = port;
-    panelServer.listen(port, '0.0.0.0');
-}
-
-panelServer.on('listening', () => {
-    console.log(`[PANEL] Web Monitor aktif di: http://localhost:${activePanelPort}`);
-});
-
-panelServer.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-        startPanelServer(activePanelPort + 1);
-    }
-});
-
-startPanelServer(8080);
-
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
+// === PARSER ARGUMEN STIKER (CROP, DURASI, VOLUME) ===
+function parseStickerArgs(argsArray) {
+    const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
+    let cropMode = 'auto';
+    let customSeconds = null;
+    let volumeFilter = null;
+    let volumeLabel = null;
+
+    for (let i = 0; i < argsArray.length; i++) {
+        const arg = argsArray[i].toLowerCase();
+
+        if (validModes.includes(arg)) {
+            cropMode = arg;
+            continue;
+        }
+
+        const durMatch = arg.match(/^(\d+)(s|d|detik)?$/);
+        if (durMatch) {
+            const val = Number(durMatch[1]);
+            if (val >= 1 && val <= 30) {
+                customSeconds = val;
+                continue;
+            }
+        }
+
+        if (arg === 'vol' || arg === 'volume') {
+            const nextVal = (argsArray[i + 1] || '').toLowerCase();
+            const parsedVol = parseVolumeToken(nextVal);
+            if (parsedVol) {
+                volumeFilter = parsedVol.filter;
+                volumeLabel = parsedVol.label;
+                i++;
+                continue;
+            }
+        } else if (arg.startsWith('vol')) {
+            const parsedVol = parseVolumeToken(arg.slice(3));
+            if (parsedVol) {
+                volumeFilter = parsedVol.filter;
+                volumeLabel = parsedVol.label;
+                continue;
+            }
+        }
+    }
+
+    return { cropMode, customSeconds, volumeFilter, volumeLabel };
+}
+
+function parseVolumeToken(token) {
+    if (!token) return null;
+    const dbMatch = token.match(/^([+-]?\d+(?:\.\d+)?)db$/);
+    if (dbMatch) {
+        const db = Math.max(-30, Math.min(30, Number(dbMatch[1])));
+        return { filter: `volume=${db}dB`, label: `${db > 0 ? '+' : ''}${db}dB` };
+    }
+    const pctMatch = token.match(/^(\d+(?:\.\d+)?)%$/);
+    if (pctMatch) {
+        const mult = Math.max(0.1, Math.min(10, Number(pctMatch[1]) / 100));
+        return { filter: `volume=${mult}`, label: `${Math.round(mult * 100)}%` };
+    }
+    const multMatch = token.match(/^(\d+(?:\.\d+)?)x?$/);
+    if (multMatch) {
+        const mult = Math.max(0.1, Math.min(10, Number(multMatch[1])));
+        return { filter: `volume=${mult}`, label: `${mult}x` };
+    }
+    return null;
+}
 
 function getMediaInfo(inputPath) {
     return new Promise((resolve) => {
@@ -561,7 +404,13 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
     exifChunkHeader.writeUInt32LE(exifPayload.length, 4);
     const exifPad = exifPayload.length % 2 === 1 ? Buffer.from([0x00]) : Buffer.alloc(0);
 
-    const chunkFourCC = webpBuffer.toString('ascii', 12, 16);
+    let baseWebp = webpBuffer;
+    const exifIndex = webpBuffer.indexOf(Buffer.from('EXIF'));
+    if (exifIndex > 12) {
+        baseWebp = webpBuffer.subarray(0, exifIndex);
+    }
+
+    const chunkFourCC = baseWebp.toString('ascii', 12, 16);
     if (chunkFourCC === 'VP8 ' || chunkFourCC === 'VP8L') {
         const vp8xHeader = Buffer.alloc(18);
         vp8xHeader.write('VP8X', 0, 4, 'ascii');
@@ -570,7 +419,7 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
         vp8xHeader.writeUIntLE(511, 12, 3);
         vp8xHeader.writeUIntLE(511, 15, 3);
 
-        const bodyWithoutRiff = webpBuffer.subarray(12);
+        const bodyWithoutRiff = baseWebp.subarray(12);
         const combined = Buffer.concat([
             Buffer.from('RIFF'),
             Buffer.alloc(4),
@@ -585,7 +434,7 @@ function addStickerExif(webpBuffer, packName = 'Sound Stickers', author = 'BotWA
         return combined;
     }
 
-    const updatedWebp = Buffer.from(webpBuffer);
+    const updatedWebp = Buffer.from(baseWebp);
     if (chunkFourCC === 'VP8X') {
         updatedWebp[20] = updatedWebp[20] | 0x08;
     }
@@ -691,16 +540,63 @@ async function renderWebp(inputPath, outputPath, isVideo = false, maxSeconds = 1
     return outputPath;
 }
 
-function renderAudioM4a(inputPath, outputPath, maxSeconds = 30) {
+function renderAudioM4a(inputPath, outputPath, maxSeconds = 30, volumeFilter = null) {
     return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
+        const cmd = ffmpeg(inputPath)
             .noVideo()
             .audioCodec('aac')
             .audioBitrate('64k')
             .audioChannels(1)
-            .audioFrequency(44100)
-            .outputOptions(['-t', String(maxSeconds), '-movflags', '+faststart'])
+            .audioFrequency(44100);
+
+        if (volumeFilter) {
+            cmd.audioFilters(volumeFilter);
+        }
+
+        cmd.outputOptions(['-t', String(maxSeconds), '-movflags', '+faststart'])
             .toFormat('ipod')
+            .save(outputPath)
+            .on('end', () => resolve(outputPath))
+            .on('error', (err) => reject(err));
+    });
+}
+
+function renderAudioMp3(inputPath, outputPath, volumeFilter = null) {
+    return new Promise((resolve, reject) => {
+        const cmd = ffmpeg(inputPath)
+            .noVideo()
+            .audioCodec('libmp3lame')
+            .audioBitrate('128k');
+
+        if (volumeFilter) {
+            cmd.audioFilters(volumeFilter);
+        }
+
+        cmd.toFormat('mp3')
+            .save(outputPath)
+            .on('end', () => resolve(outputPath))
+            .on('error', (err) => reject(err));
+    });
+}
+
+function renderVideoVolume(inputPath, outputPath, volumeFilter) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .videoCodec('copy')
+            .audioCodec('aac')
+            .audioBitrate('128k')
+            .audioFilters(volumeFilter)
+            .outputOptions(['-movflags', '+faststart'])
+            .save(outputPath)
+            .on('end', () => resolve(outputPath))
+            .on('error', (err) => reject(err));
+    });
+}
+
+function convertWebpToPng(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions(['-vframes', '1'])
             .save(outputPath)
             .on('end', () => resolve(outputPath))
             .on('error', (err) => reject(err));
@@ -773,7 +669,7 @@ async function startBot() {
             isPairingActive = false;
             if (pairingTimeout) clearInterval(pairingTimeout);
             try { rl.close(); } catch (e) {}
-            console.log(`\n[SUKSES] Bot WhatsApp aktif! Mode: ${botConfig.adminOnly ? 'ADMIN ONLY' : 'PUBLIC'} | Waktu: ${formatWib()}`);
+            console.log(`\n[SUKSES] Bot WhatsApp aktif! Waktu: ${formatWib()}`);
         }
         if (connection === 'close') {
             activeSock = null;
@@ -803,19 +699,14 @@ async function startBot() {
             senderDigits = botDigits;
         }
 
-        const cleanOwners = botConfig.owners.map((n) => normalizePhoneNumber(n));
-        const cleanAllowedUsers = botConfig.allowedUsers.map((n) => normalizePhoneNumber(n));
-
         const isOwner =
             Boolean(msg.key.fromMe) ||
-            (senderDigits !== '' && (senderDigits === botDigits || senderDigits === botLidDigits || cleanOwners.includes(senderDigits)));
-
-        const isAllowedUser = isOwner || (senderDigits !== '' && cleanAllowedUsers.includes(senderDigits));
+            (senderDigits !== '' && (senderDigits === botDigits || senderDigits === botLidDigits));
 
         const remoteDigits = extractDigits(remoteJid);
         const isSelfChat =
             !isGroup &&
-            (remoteDigits === botDigits || remoteDigits === botLidDigits || cleanOwners.includes(remoteDigits));
+            (remoteDigits === botDigits || remoteDigits === botLidDigits);
 
         const messageType = Object.keys(msg.message)[0];
         const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -831,185 +722,7 @@ async function startBot() {
         const parts = caption.trim().split(/\s+/);
         const baseCmd = (parts[0] || '').toLowerCase();
 
-        // === CATAT RIWAYAT PERCAKAPAN UNTUK WEB MONITOR ===
-        let chatEntry = null;
-        if (senderDigits && !isEdited) {
-            const isCommandOrPrivate = !isGroup || caption.trim().startsWith('.');
-            if (isCommandOrPrivate) {
-                const contextLabel = isGroup ? 'Grup' : isSelfChat ? 'Self-Chat' : 'Chat Pribadi';
-                const initialStatus = (botConfig.adminOnly && !isAllowedUser)
-                    ? '[Diabaikan: Belum terdaftar di .add]'
-                    : 'Diproses oleh bot';
-                chatEntry = recordChat(
-                    senderDigits,
-                    msg.pushName || (isOwner ? 'Admin / Owner' : 'Pengguna WA'),
-                    contextLabel,
-                    caption.trim() || `[${messageType}]`,
-                    initialStatus
-                );
-            }
-        }
-
-        // === PERINTAH MANAJEMEN PENGGUNA & ADMIN MANUAL (.add, .del, .listuser) ===
-        if (baseCmd === '.add') {
-            if (!isOwner) return;
-
-            const arg1 = (parts[1] || '').toLowerCase();
-            const isAddingAdmin = arg1 === 'admin' || arg1 === 'owner';
-            const rawNumInput = isAddingAdmin ? parts.slice(2).join('') : parts.slice(1).join('');
-
-            let targetNum = normalizePhoneNumber(rawNumInput);
-            if (!targetNum) {
-                const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-                if (quotedParticipant) {
-                    targetNum = normalizePhoneNumber(extractDigits(quotedParticipant));
-                }
-            }
-
-            if (!targetNum || targetNum.length < 9) {
-                await sock.sendMessage(
-                    remoteJid,
-                    {
-                        text:
-                            `⚠️ *Format salah!*\n` +
-                            `• Tambah Pengguna: *.add 0812xxx* (atau +62 812-xxx)\n` +
-                            `• Tambah Admin: *.add admin 0812xxx*\n` +
-                            `• _(Bisa juga dengan me-reply pesan orangnya lalu ketik .add)_`
-                    },
-                    { quoted: msg }
-                );
-                return;
-            }
-
-            if (isAddingAdmin) {
-                if (!cleanOwners.includes(targetNum)) botConfig.owners.push(targetNum);
-                if (!cleanAllowedUsers.includes(targetNum)) botConfig.allowedUsers.push(targetNum);
-                saveConfig(botConfig);
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: `👑 Nomor *+${targetNum}* berhasil ditambahkan sebagai *Admin/Owner* secara permanen.` },
-                    { quoted: msg }
-                );
-                updateChatReply(chatEntry, `Menambahkan Admin +${targetNum}`);
-            } else {
-                if (cleanAllowedUsers.includes(targetNum)) {
-                    await sock.sendMessage(
-                        remoteJid,
-                        { text: `ℹ️ Nomor *+${targetNum}* sudah terdaftar di daftar pengguna.` },
-                        { quoted: msg }
-                    );
-                    return;
-                }
-                botConfig.allowedUsers.push(targetNum);
-                saveConfig(botConfig);
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: `✅ Nomor *+${targetNum}* berhasil ditambahkan ke daftar pengguna permanen.` },
-                    { quoted: msg }
-                );
-                updateChatReply(chatEntry, `Menambahkan Pengguna +${targetNum}`);
-            }
-            return;
-        }
-
-        if (baseCmd === '.del' || baseCmd === '.hapus') {
-            if (!isOwner) return;
-            let targetNum = normalizePhoneNumber(parts.slice(1).join(''));
-            if (!targetNum) {
-                const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant;
-                if (quotedParticipant) {
-                    targetNum = normalizePhoneNumber(extractDigits(quotedParticipant));
-                }
-            }
-
-            if (!targetNum) {
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: '⚠️ Masukkan nomor yang ingin dihapus. Contoh: *.del 0812xxx*' },
-                    { quoted: msg }
-                );
-                return;
-            }
-
-            const beforeOwner = botConfig.owners.length;
-            const beforeUser = botConfig.allowedUsers.length;
-            botConfig.owners = botConfig.owners.filter((n) => normalizePhoneNumber(n) !== targetNum);
-            botConfig.allowedUsers = botConfig.allowedUsers.filter((n) => normalizePhoneNumber(n) !== targetNum);
-
-            if (botConfig.owners.length === beforeOwner && botConfig.allowedUsers.length === beforeUser) {
-                await sock.sendMessage(
-                    remoteJid,
-                    { text: `❌ Nomor *+${targetNum}* tidak ditemukan di daftar Admin maupun Pengguna.` },
-                    { quoted: msg }
-                );
-                return;
-            }
-
-            saveConfig(botConfig);
-            await sock.sendMessage(
-                remoteJid,
-                { text: `🗑️ Nomor *+${targetNum}* berhasil dihapus dari daftar Admin & Pengguna.` },
-                { quoted: msg }
-            );
-            updateChatReply(chatEntry, `Menghapus nomor +${targetNum}`);
-            return;
-        }
-
-        if (baseCmd === '.listuser') {
-            if (!isOwner) return;
-            const adminsText =
-                botConfig.owners.length > 0
-                    ? botConfig.owners.map((n, i) => `${i + 1}. +${normalizePhoneNumber(n)}`).join('\n')
-                    : '_Belum ada admin tambahan_';
-
-            const usersText =
-                botConfig.allowedUsers.length > 0
-                    ? botConfig.allowedUsers.map((n, i) => `${i + 1}. +${normalizePhoneNumber(n)}`).join('\n')
-                    : '_Belum ada pengguna terdaftar_';
-
-            await sock.sendMessage(
-                remoteJid,
-                {
-                    text:
-                        `👥 *DAFTAR AKSES BOT (PERMANEN)*\n` +
-                        `Mode Saat Ini: *${botConfig.adminOnly ? '🔒 Admin Only (Khusus Daftar Ini)' : '🌐 Public'}*\n\n` +
-                        `👑 *Admin / Owner:*\n${adminsText}\n\n` +
-                        `✅ *Pengguna Terdaftar (.add):*\n${usersText}`
-                },
-                { quoted: msg }
-            );
-            updateChatReply(chatEntry, 'Menampilkan .listuser');
-            return;
-        }
-
-        // === PERINTAH SAKLAR MODE ===
-        if (baseCmd === '.adminonly' || baseCmd === '.self') {
-            if (!isOwner) return;
-            botConfig.adminOnly = true;
-            saveConfig(botConfig);
-            await sock.sendMessage(
-                remoteJid,
-                { text: '🔒 *Mode Admin Only Aktif*\nHanya Admin dan nomor yang terdaftar di *.add* yang dapat memakai bot.' },
-                { quoted: msg }
-            );
-            updateChatReply(chatEntry, 'Mengaktifkan Mode Admin Only');
-            return;
-        }
-
-        if (baseCmd === '.public' || baseCmd === '.alluser') {
-            if (!isOwner) return;
-            botConfig.adminOnly = false;
-            saveConfig(botConfig);
-            await sock.sendMessage(
-                remoteJid,
-                { text: '🌐 *Mode Public Aktif*\nSemua member sekarang dapat menggunakan perintah stiker bot.' },
-                { quoted: msg }
-            );
-            updateChatReply(chatEntry, 'Mengaktifkan Mode Public');
-            return;
-        }
-
-        // === FITUR PESAN TERJADWAL ===
+        // === FITUR PESAN TERJADWAL (KHUSUS OWNER) ===
         if (baseCmd === '.jam') {
             if (!isOwner) return;
             const activeCount = schedules.filter((j) => j.status === 'ACTIVE').length;
@@ -1018,7 +731,6 @@ async function startBot() {
                 { text: `🕒 *Waktu Realtime Bot:*\n${formatWib()}\nAntrean jadwal aktif: *${activeCount}*` },
                 { quoted: msg }
             );
-            updateChatReply(chatEntry, `Cek jam (${formatWib()})`);
             return;
         }
 
@@ -1044,7 +756,6 @@ async function startBot() {
                     },
                     { quoted: msg }
                 );
-                updateChatReply(chatEntry, 'Mengirim templat formulir .jadwal');
                 return;
             }
 
@@ -1058,7 +769,6 @@ async function startBot() {
                     { text: `⚠️ *Formulir belum lengkap!*\nPastikan mengisi *Nomor:*, *Waktu:*, dan *Pesan:*.\nKetik *.jadwal* tanpa teks untuk templat kosong.` },
                     { quoted: msg }
                 );
-                updateChatReply(chatEntry, 'Gagal .jadwal: Formulir belum lengkap');
                 return;
             }
 
@@ -1170,7 +880,6 @@ async function startBot() {
                 { quoted: msg }
             );
             await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
-            updateChatReply(chatEntry, `Jadwal #${newJob.id} dibuat untuk ${targetLabel} (${scheduledText})`);
             return;
         }
 
@@ -1291,49 +1000,63 @@ async function startBot() {
 
         if (isEdited) return;
 
-        // === GERBANG FILTER AKSES ===
-        if (botConfig.adminOnly && !isAllowedUser) {
-            return;
-        }
-
-        const cropArg = (parts[1] || '').toLowerCase();
-        const validModes = ['tengah', 'center', 'crop', 'atas', 'top', 'bawah', 'bottom', 'kiri', 'left', 'kanan', 'right'];
-        const cropMode = validModes.includes(cropArg) ? cropArg : 'auto';
-
-        // === MENU DINAMIS ===
+        // === MENU UTAMA ===
         if (baseCmd === '.menu') {
             let menuText =
                 `*BOT SOUND STICKER*\n\n` +
-                `*Perintah Stiker:*\n` +
-                `• *.s* → Ubah foto/video/stiker jadi stiker (auto transparan)\n` +
-                `• *.sa* → Ubah video jadi Sound Sticker bersuara\n` +
-                `• *.s tengah* / *.sa tengah* → Potong 1:1 penuh\n` +
-                `  _(Opsi arah: tengah, atas, bawah, kiri, kanan)_`;
+                `*1. Pembuat Stiker:*\n` +
+                `• *.s* → Foto/video/stiker jadi stiker (auto transparan)\n` +
+                `• *.sa* → Video jadi Sound Sticker bersuara\n` +
+                `• *Opsi Potong:* tengah, atas, bawah, kiri, kanan\n` +
+                `• *Opsi Durasi:* tambah detik (maks 30s), misal: *.sa 8s*\n` +
+                `• *Opsi Volume:* tambah *vol <angka>*, misal: *.sa 10s vol 2*\n\n` +
+                `*2. Editor & Konverter Media:*\n` +
+                `• *.vol <angka>* → Ubah volume video atau Sound Sticker\n` +
+                `  _(Contoh: .vol 2 untuk 200%, .vol 15db untuk +15dB)_\n` +
+                `• *.wm Pack | Author* → Ubah watermark nama pack stiker\n` +
+                `• *.toimg* → Ubah stiker biasa jadi gambar PNG\n` +
+                `• *.tomp3* → Ambil audio MP3 dari video / Sound Sticker`;
 
             if (isOwner && isSelfChat) {
-                const statusText = botConfig.adminOnly ? '🔒 Admin Only' : '🌐 Public';
                 menuText +=
                     `\n\n━━━━━━━━━━━━━━━━━━\n` +
-                    `👑 *MENU KHUSUS ADMIN* (${statusText})\n` +
-                    `🌐 Web Monitor: *http://localhost:${activePanelPort}*\n\n` +
-                    `*1. Manajemen Pengguna (.add):*\n` +
-                    `• *.add* 0812xxx → Tambah pengguna permanen\n` +
-                    `• *.add admin* 0812xxx → Tambah admin permanen\n` +
-                    `• *.del* 0812xxx → Hapus pengguna/admin\n` +
-                    `• *.listuser* → Lihat daftar admin & pengguna\n\n` +
-                    `*2. Pesan Terjadwal:*\n` +
+                    `👑 *MENU KHUSUS OWNER*\n\n` +
+                    `*Pesan Terjadwal & Sistem:*\n` +
                     `• *.jadwal* 0812xxx, 12:30, 1, pesan\n` +
                     `  _(Atau ketik .jadwal saja lalu Edit pesanmu)_\n` +
                     `• *.listjadwal* → Cek antrean & hitung mundur\n` +
                     `• *.stopjadwal* id / all → Hentikan jadwal\n` +
                     `• *.riwayatjadwal* → Catatan terkirim & berhenti\n` +
-                    `• *.jam* → Cek waktu realtime WIB bot\n\n` +
-                    `*3. Kontrol Akses Bot:*\n` +
-                    `• *.adminonly* / *.public* → Kunci atau buka akses bot`;
+                    `• *.hapusriwayat* → Bersihkan riwayat jadwal\n` +
+                    `• *.jam* → Cek waktu realtime WIB bot\n` +
+                    `• *.ping* → Cek kecepatan respons & RAM Termux`;
             }
 
             await sock.sendMessage(remoteJid, { text: menuText }, { quoted: msg });
-            updateChatReply(chatEntry, 'Mengirim daftar .menu');
+            return;
+        }
+
+        // === CEK STATUS BOT & RAM (.ping) ===
+        if (baseCmd === '.ping') {
+            const startTick = Date.now();
+            const freeMemMB = Math.round(os.freemem() / 1024 / 1024);
+            const totalMemMB = Math.round(os.totalmem() / 1024 / 1024);
+            const uptimeSec = Math.floor(process.uptime());
+            const upHours = Math.floor(uptimeSec / 3600);
+            const upMins = Math.floor((uptimeSec % 3600) / 60);
+            const latency = Date.now() - startTick;
+
+            await sock.sendMessage(
+                remoteJid,
+                {
+                    text:
+                        `⚡ *Status Bot Termux*\n` +
+                        `• Respon: *${latency} ms*\n` +
+                        `• Aktif selama: *${upHours} jam ${upMins} menit*\n` +
+                        `• RAM Tersisa: *${freeMemMB} MB / ${totalMemMB} MB*`
+                },
+                { quoted: msg }
+            );
             return;
         }
 
@@ -1350,11 +1073,15 @@ async function startBot() {
             quotedType === 'videoMessage' ||
             Boolean(msg.message.stickerMessage?.isAnimated || quotedMsg?.stickerMessage?.isAnimated);
 
-        // Perintah .s
+        const stickerObj = msg.message.stickerMessage || quotedMsg?.stickerMessage;
+        const hasEmbeddedAudio = Boolean(stickerObj?.audioMessage?.url || stickerObj?.audioMessage?.directPath);
+
+        const { cropMode, customSeconds, volumeFilter, volumeLabel } = parseStickerArgs(parts.slice(1));
+
+        // === PERINTAH .s ===
         if (baseCmd === '.s') {
             if (!targetMedia) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
-                updateChatReply(chatEntry, 'Gagal .s: Tidak ada media dilampirkan');
                 return;
             }
 
@@ -1364,36 +1091,34 @@ async function startBot() {
             const tempWebp = path.join(__dirname, `out_${stamp}.webp`);
 
             try {
-                console.log(`[PROSES] Membuat stiker .s (mode: ${cropMode}, video: ${isVideo})...`);
                 await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
 
                 const buffer = await downloadMediaMessage(targetMedia, 'buffer', {});
                 fs.writeFileSync(tempIn, buffer);
 
                 const { duration, autoCrop } = await getMediaInfo(tempIn);
-                await renderWebp(tempIn, tempWebp, isVideo, duration, cropMode, autoCrop);
+                const finalDuration = customSeconds ? Math.min(30, customSeconds) : duration;
+
+                await renderWebp(tempIn, tempWebp, isVideo, finalDuration, cropMode, autoCrop);
                 const finalSticker = addStickerExif(fs.readFileSync(tempWebp));
 
                 await sock.sendMessage(remoteJid, { sticker: finalSticker }, { quoted: msg });
                 await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
-                updateChatReply(chatEntry, `Berhasil membuat stiker (.s ${cropMode})`);
-                console.log('[SELESAI] Stiker .s terkirim!');
             } catch (err) {
                 console.error('Detail Error .s:', err);
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .s: ${err.message}` }, { quoted: msg });
-                updateChatReply(chatEntry, `Error .s: ${err.message}`);
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
                 if (fs.existsSync(tempWebp)) fs.unlinkSync(tempWebp);
             }
+            return;
         }
 
-        // Perintah .sa
+        // === PERINTAH .sa (DENGAN DURASI & VOLUME KUSTOM) ===
         if (baseCmd === '.sa') {
             if (!targetMedia || !isVideo || isSticker) {
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
-                updateChatReply(chatEntry, 'Gagal .sa: Wajib melampirkan video');
                 return;
             }
 
@@ -1403,22 +1128,20 @@ async function startBot() {
             const tempM4a = path.join(__dirname, `sa_aud_${stamp}.m4a`);
 
             try {
-                console.log(`[PROSES] Mengunduh video untuk .sa (mode: ${cropMode})...`);
                 await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
 
                 const buffer = await downloadMediaMessage(targetMedia, 'buffer', {});
                 fs.writeFileSync(tempIn, buffer);
 
                 const { duration, autoCrop } = await getMediaInfo(tempIn);
-                console.log(`[PROSES] Render .sa mode=${cropMode}, durasi=${duration}s...`);
+                const finalDuration = customSeconds ? Math.min(30, customSeconds) : duration;
 
-                await renderWebp(tempIn, tempWebp, true, duration, cropMode, autoCrop);
-                await renderAudioM4a(tempIn, tempM4a, duration);
+                console.log(`[PROSES] .sa mode=${cropMode}, durasi=${finalDuration}s, vol=${volumeLabel || 'normal'}`);
+
+                await renderWebp(tempIn, tempWebp, true, finalDuration, cropMode, autoCrop);
+                await renderAudioM4a(tempIn, tempM4a, finalDuration, volumeFilter);
 
                 const rawWebp = fs.readFileSync(tempWebp);
-                const sizeKB = Math.round(rawWebp.length / 1024);
-                console.log(`[INFO] Ukuran akhir WebP: ${sizeKB} KB`);
-
                 const stickerBuffer = addStickerExif(rawWebp, 'Sound Stickers', 'BotWA');
                 const audioBuffer = fs.readFileSync(tempM4a);
 
@@ -1432,7 +1155,7 @@ async function startBot() {
                         audio: audioBuffer,
                         mimetype: 'audio/mp4',
                         ptt: false,
-                        seconds: duration
+                        seconds: finalDuration
                     },
                     { upload: sock.waUploadToServer }
                 );
@@ -1447,18 +1170,269 @@ async function startBot() {
 
                 await sock.relayMessage(remoteJid, waMsg.message, { messageId: waMsg.key.id });
                 await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
-                updateChatReply(chatEntry, `Berhasil membuat Sound Sticker (.sa ${cropMode})`);
-                console.log('[SELESAI] Sound Sticker berhasil terkirim!');
             } catch (err) {
                 console.error('Detail Error .sa:', err);
                 await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
                 await sock.sendMessage(remoteJid, { text: `Error .sa: ${err.message}` }, { quoted: msg });
-                updateChatReply(chatEntry, `Error .sa: ${err.message}`);
             } finally {
                 if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
                 if (fs.existsSync(tempWebp)) fs.unlinkSync(tempWebp);
                 if (fs.existsSync(tempM4a)) fs.unlinkSync(tempM4a);
             }
+            return;
+        }
+
+        // === PERINTAH .vol (UBAH VOLUME VIDEO ATAU SOUND STICKER) ===
+        if (baseCmd === '.vol' || baseCmd === '.volume') {
+            const rawVolArg = (parts[1] || '').toLowerCase();
+            const parsedVol = parseVolumeToken(rawVolArg);
+
+            if (!parsedVol) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Masukkan tingkat volume. Contoh:\n• *.vol 2* (2x lebih keras / 200%)\n• *.vol 15db* (naik +15dB)\n• *.vol 0.5* (kecilkan 50%)' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            if (!targetMedia || (!isVideo && !hasEmbeddedAudio)) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Balas video atau *Sound Sticker* yang ingin diubah volumenya.' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const stamp = Date.now();
+            await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+
+            if (isSticker && hasEmbeddedAudio) {
+                const tempAudioIn = path.join(__dirname, `vol_aud_in_${stamp}.m4a`);
+                const tempAudioOut = path.join(__dirname, `vol_aud_out_${stamp}.m4a`);
+
+                try {
+                    const stickerBuf = await downloadMediaMessage(targetMedia, 'buffer', {});
+                    const audioMediaObj = { key: msg.key, message: { audioMessage: stickerObj.audioMessage } };
+                    const audioBuf = await downloadMediaMessage(audioMediaObj, 'buffer', {});
+                    fs.writeFileSync(tempAudioIn, audioBuf);
+
+                    const duration = stickerObj.audioMessage.seconds || 10;
+                    await renderAudioM4a(tempAudioIn, tempAudioOut, duration, parsedVol.filter);
+
+                    const uploadedSticker = await prepareWAMessageMedia(
+                        { sticker: stickerBuf },
+                        { upload: sock.waUploadToServer }
+                    );
+
+                    const uploadedAudio = await prepareWAMessageMedia(
+                        {
+                            audio: fs.readFileSync(tempAudioOut),
+                            mimetype: 'audio/mp4',
+                            ptt: false,
+                            seconds: duration
+                        },
+                        { upload: sock.waUploadToServer }
+                    );
+
+                    uploadedSticker.stickerMessage.audioMessage = uploadedAudio.audioMessage;
+
+                    const waMsg = generateWAMessageFromContent(
+                        remoteJid,
+                        { stickerMessage: uploadedSticker.stickerMessage },
+                        { userJid: sock.user.id, quoted: msg }
+                    );
+
+                    await sock.relayMessage(remoteJid, waMsg.message, { messageId: waMsg.key.id });
+                    await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                } catch (err) {
+                    await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                    await sock.sendMessage(remoteJid, { text: `Error .vol stiker: ${err.message}` }, { quoted: msg });
+                } finally {
+                    if (fs.existsSync(tempAudioIn)) fs.unlinkSync(tempAudioIn);
+                    if (fs.existsSync(tempAudioOut)) fs.unlinkSync(tempAudioOut);
+                }
+                return;
+            }
+
+            if (isVideo && !isSticker) {
+                const tempVidIn = path.join(__dirname, `vol_vid_in_${stamp}.mp4`);
+                const tempVidOut = path.join(__dirname, `vol_vid_out_${stamp}.mp4`);
+
+                try {
+                    const vidBuf = await downloadMediaMessage(targetMedia, 'buffer', {});
+                    fs.writeFileSync(tempVidIn, vidBuf);
+
+                    await renderVideoVolume(tempVidIn, tempVidOut, parsedVol.filter);
+
+                    await sock.sendMessage(
+                        remoteJid,
+                        {
+                            video: fs.readFileSync(tempVidOut),
+                            caption: `🔊 Volume diubah ke *${parsedVol.label}*`
+                        },
+                        { quoted: msg }
+                    );
+                    await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+                } catch (err) {
+                    await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                    await sock.sendMessage(remoteJid, { text: `Error .vol video: ${err.message}` }, { quoted: msg });
+                } finally {
+                    if (fs.existsSync(tempVidIn)) fs.unlinkSync(tempVidIn);
+                    if (fs.existsSync(tempVidOut)) fs.unlinkSync(tempVidOut);
+                }
+                return;
+            }
+        }
+
+        // === PERINTAH .wm (UBAH WATERMARK PACK & AUTHOR STIKER) ===
+        if (baseCmd === '.wm') {
+            if (!isSticker || !targetMedia) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Balas stiker yang ingin diubah namanya.\nContoh: *.wm Koleksi Saya | Budi*' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const rawWm = caption.slice(parts[0].length).trim();
+            if (!rawWm) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Masukkan nama pack. Contoh: *.wm Nama Pack | Nama Pembuat*' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const [packRaw, authorRaw] = rawWm.split('|').map((s) => s.trim());
+            const packName = packRaw || 'Sound Stickers';
+            const authorName = authorRaw || 'BotWA';
+
+            try {
+                await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+                const stickerBuf = await downloadMediaMessage(targetMedia, 'buffer', {});
+                const updatedSticker = addStickerExif(stickerBuf, packName, authorName);
+
+                if (hasEmbeddedAudio) {
+                    const audioMediaObj = { key: msg.key, message: { audioMessage: stickerObj.audioMessage } };
+                    const audioBuf = await downloadMediaMessage(audioMediaObj, 'buffer', {});
+
+                    const uploadedSticker = await prepareWAMessageMedia(
+                        { sticker: updatedSticker },
+                        { upload: sock.waUploadToServer }
+                    );
+                    const uploadedAudio = await prepareWAMessageMedia(
+                        {
+                            audio: audioBuf,
+                            mimetype: 'audio/mp4',
+                            ptt: false,
+                            seconds: stickerObj.audioMessage.seconds || 10
+                        },
+                        { upload: sock.waUploadToServer }
+                    );
+                    uploadedSticker.stickerMessage.audioMessage = uploadedAudio.audioMessage;
+
+                    const waMsg = generateWAMessageFromContent(
+                        remoteJid,
+                        { stickerMessage: uploadedSticker.stickerMessage },
+                        { userJid: sock.user.id, quoted: msg }
+                    );
+                    await sock.relayMessage(remoteJid, waMsg.message, { messageId: waMsg.key.id });
+                } else {
+                    await sock.sendMessage(remoteJid, { sticker: updatedSticker }, { quoted: msg });
+                }
+
+                await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+            } catch (err) {
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                await sock.sendMessage(remoteJid, { text: `Error .wm: ${err.message}` }, { quoted: msg });
+            }
+            return;
+        }
+
+        // === PERINTAH .toimg (STIKER STATIS KE GAMBAR PNG) ===
+        if (baseCmd === '.toimg') {
+            if (!isSticker || !targetMedia || isVideo) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Balas stiker biasa (tidak bergerak) dengan perintah *.toimg*.' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const stamp = Date.now();
+            const tempWebp = path.join(__dirname, `toimg_${stamp}.webp`);
+            const tempPng = path.join(__dirname, `toimg_${stamp}.png`);
+
+            try {
+                await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+                const buf = await downloadMediaMessage(targetMedia, 'buffer', {});
+                fs.writeFileSync(tempWebp, buf);
+
+                await convertWebpToPng(tempWebp, tempPng);
+                await sock.sendMessage(remoteJid, { image: fs.readFileSync(tempPng) }, { quoted: msg });
+                await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+            } catch (err) {
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                await sock.sendMessage(remoteJid, { text: `Error .toimg: ${err.message}` }, { quoted: msg });
+            } finally {
+                if (fs.existsSync(tempWebp)) fs.unlinkSync(tempWebp);
+                if (fs.existsSync(tempPng)) fs.unlinkSync(tempPng);
+            }
+            return;
+        }
+
+        // === PERINTAH .tomp3 (EKSTRAK AUDIO DARI VIDEO / SOUND STICKER) ===
+        if (baseCmd === '.tomp3' || baseCmd === '.toaudio') {
+            if (!targetMedia || (!isVideo && !hasEmbeddedAudio)) {
+                await sock.sendMessage(
+                    remoteJid,
+                    { text: '⚠️ Balas video atau *Sound Sticker* untuk diambil audionya.' },
+                    { quoted: msg }
+                );
+                return;
+            }
+
+            const stamp = Date.now();
+            const tempIn = path.join(__dirname, `tomp3_in_${stamp}.mp4`);
+            const tempMp3 = path.join(__dirname, `tomp3_out_${stamp}.mp3`);
+
+            try {
+                await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
+
+                let buf;
+                if (isSticker && hasEmbeddedAudio) {
+                    const audioMediaObj = { key: msg.key, message: { audioMessage: stickerObj.audioMessage } };
+                    buf = await downloadMediaMessage(audioMediaObj, 'buffer', {});
+                } else {
+                    buf = await downloadMediaMessage(targetMedia, 'buffer', {});
+                }
+
+                fs.writeFileSync(tempIn, buf);
+                await renderAudioMp3(tempIn, tempMp3, volumeFilter);
+
+                await sock.sendMessage(
+                    remoteJid,
+                    {
+                        audio: fs.readFileSync(tempMp3),
+                        mimetype: 'audio/mpeg',
+                        ptt: false
+                    },
+                    { quoted: msg }
+                );
+                await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
+            } catch (err) {
+                await sock.sendMessage(remoteJid, { react: { text: '❌', key: msg.key } });
+                await sock.sendMessage(remoteJid, { text: `Error .tomp3: ${err.message}` }, { quoted: msg });
+            } finally {
+                if (fs.existsSync(tempIn)) fs.unlinkSync(tempIn);
+                if (fs.existsSync(tempMp3)) fs.unlinkSync(tempMp3);
+            }
+            return;
         }
     }
 
